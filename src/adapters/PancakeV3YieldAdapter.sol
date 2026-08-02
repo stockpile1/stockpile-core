@@ -136,7 +136,7 @@ contract PancakeV3YieldAdapter is BaseYieldAdapter {
     /// @param assetHash Canonical handle of the position to harvest.
     /// @param minOut    Minimum yield token out of the internal non-yield-side swap.
     /// @return Amount of yield token forwarded to the UGM.
-    function harvestWithMinOut(bytes32 assetHash, uint256 minOut) external returns (uint256) {
+    function harvestWithMinOut(bytes32 assetHash, uint256 minOut) external onlyOwner returns (uint256) {
         return _harvest(assetHash, minOut, true);
     }
 

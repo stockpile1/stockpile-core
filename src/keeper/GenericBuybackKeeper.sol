@@ -12,7 +12,9 @@ import { IPancakeV3SwapRouter } from "../interfaces/external/IPancakeV3.sol";
 ///         TAKEOVER and forwards it to a configured receiver:
 ///         `Tax Token -> Swap (PancakeSwap V3) -> TAKEOVER -> receiver`.
 /// @dev Mirrors Takeover's GenericBuybackKeeper. Revenue is routed here (e.g. via
-///      UGM.withdrawTaxRevenue), then anyone may trigger `convert`.
+///      UGM.withdrawTaxRevenue), then the owner (guardian/keeper) triggers `convert`.
+///      `convert` is `onlyOwner`: it swaps with a caller-supplied `minAmountOut`, so a
+///      permissionless caller could pass 0 and let an attacker sandwich the swap (COM-MEV).
 contract GenericBuybackKeeper is Ownable {
     using SafeERC20 for IERC20;
 
@@ -59,6 +61,7 @@ contract GenericBuybackKeeper is Ownable {
     /// @return amountOut Amount of TAKEOVER sent to the receiver.
     function convert(address tokenIn, uint24 fee, uint256 minAmountOut)
         external
+        onlyOwner
         returns (uint256 amountOut)
     {
         require(tokenIn != takeover, "tokenIn==TAKEOVER");

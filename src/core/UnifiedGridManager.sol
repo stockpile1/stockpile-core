@@ -632,7 +632,7 @@ contract UnifiedGridManager is IGrid, Ownable, ReentrancyGuard {
     /// @dev Adapters must wrap BNB to WBNB before forwarding, keeping payout accounting to a
     ///      single ERC20 per grid.
     function receiveYieldETH(bytes32, uint256) external payable {
-        revert("native unsupported: wrap to WBNB");
+        require(false, "native unsupported: wrap to WBNB");
     }
 
     // --------------------------------------------------------------------- //
@@ -737,7 +737,7 @@ contract UnifiedGridManager is IGrid, Ownable, ReentrancyGuard {
         try IGridHooksV23(m).beforeClaim{ gas: GOVERNANCE_HOOK_GAS_CAP }(gridId, seatId, buyer, newPrice) returns (bool ok) {
             require(ok, "hook: claim vetoed");
         } catch {
-            revert("hook: claim reverted");
+            require(false, "hook: claim reverted");
         }
     }
 
@@ -747,7 +747,7 @@ contract UnifiedGridManager is IGrid, Ownable, ReentrancyGuard {
         try IGridHooksV23(m).beforeBuyout{ gas: GOVERNANCE_HOOK_GAS_CAP }(gridId, seatId, from, to, price) returns (bool ok) {
             require(ok, "hook: buyout vetoed");
         } catch {
-            revert("hook: buyout reverted");
+            require(false, "hook: buyout reverted");
         }
     }
 
@@ -757,7 +757,7 @@ contract UnifiedGridManager is IGrid, Ownable, ReentrancyGuard {
         try IGridHooksV23(m).beforePriceChange{ gas: GOVERNANCE_HOOK_GAS_CAP }(gridId, seatId, holder, oldP, newP) returns (bool ok) {
             require(ok, "hook: price vetoed");
         } catch {
-            revert("hook: price reverted");
+            require(false, "hook: price reverted");
         }
     }
 

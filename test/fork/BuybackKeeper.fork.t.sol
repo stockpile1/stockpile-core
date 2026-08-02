@@ -119,4 +119,12 @@ contract BuybackKeeperForkTest is ForkBase {
         keeper.setReceiver(newReceiver);
         assertEq(keeper.receiver(), newReceiver, "owner can rotate receiver");
     }
+    /// @notice COM-MEV-SANDWICH fix: `convert` is now owner-gated, so a stranger can no longer force an
+    ///         unprotected swap with caller-supplied slippage (minAmountOut=0) and sandwich it.
+    function test_Convert_OnlyOwner_RevertsForStranger() public {
+        address stranger = makeAddr("stranger");
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
+        keeper.convert(BscAddresses.WBNB, FEE, 0);
+    }
 }

@@ -14,6 +14,7 @@ import {
     IPancakeV3Pool
 } from "../../src/interfaces/external/IPancakeV3.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
 
 /// @notice Fork test for the PancakeSwap V3 adapter against the REAL Pancake V3 contracts
 ///         on BSC. To make fees deterministic, we create an isolated MockToken/WBNB pool
@@ -161,5 +162,14 @@ contract PancakeV3AdapterForkTest is ForkBase {
                 sqrtPriceLimitX96: 0
             })
         );
+    }
+    /// @notice COM-MEV-SANDWICH fix: the swap path `harvestWithMinOut` is now owner-gated, so a
+    ///         stranger can no longer trigger it with minOut=0 and sandwich the pool swap.
+    function test_HarvestWithMinOut_OnlyOwner_RevertsForStranger() public {
+        bytes32 assetHash = keccak256("pv3.asset");
+        address stranger = makeAddr("stranger");
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
+        adapter.harvestWithMinOut(assetHash, 0);
     }
 }

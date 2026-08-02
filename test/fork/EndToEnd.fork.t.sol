@@ -294,12 +294,14 @@ contract EndToEndForkTest is ForkBase {
         return (-hi, hi);
     }
 
-    /// @dev Create + initialize (1:1) an isolated pool; requires that none exists at this tier.
+    /// @dev Get-or-create + initialize an isolated pool. Idempotent against fork-state drift: if the
+    ///      tier already exists at the pinned/live block, reuse it and only initialize when unset
+    ///      (initialize reverts on an already-initialized pool, so it is guarded by try/catch).
     function _createPool(address a, address b, uint24 fee) internal returns (address pool) {
         (address t0, address t1) = _sorted(a, b);
-        require(factory.getPool(t0, t1, fee) == address(0), "pool already exists");
-        pool = factory.createPool(t0, t1, fee);
-        IPancakeV3Pool(pool).initialize(SQRT_P_1TO1);
+        pool = factory.getPool(t0, t1, fee);
+        if (pool == address(0)) pool = factory.createPool(t0, t1, fee);
+        try IPancakeV3Pool(pool).initialize(SQRT_P_1TO1) {} catch {}
     }
 
     /// @dev Mint a full-range position with equal desired amounts of each side to `recipient`.
