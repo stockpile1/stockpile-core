@@ -37,8 +37,11 @@ user money through it.
 **Admin powers are capped and non-lock-out:**
 - Fee knobs are bounded by constants: `MAX_TAX_BPS = 1000` (10%/week grid tax), `MAX_PROTOCOL_BPS = 5000`
   (each protocol cut ≤ 50%; protocol+creator seat-sale cuts combined < 100%). The owner cannot set 100% fees.
-- `pauseGrid` / `deprecateGrid` **keep every user-exit path open** (`withdrawDeposit`, `abandonSeat`,
-  `claimYield`, `claimPayout`, `pokeTax`) — a deprecated/paused grid cannot trap user funds.
+- `pauseGrid` / `deprecateGrid` block new `buySeat` (including the Dutch reclaim of a forfeited seat) but keep
+  every **already-settled** balance withdrawable — `withdrawDeposit` (your own deposit), `claimYield`,
+  `claimPayout` — so nothing a user already owns is trapped. (A seat still in its Dutch window at deprecation
+  freezes: the forfeited holder's *contingent* clearing payout only settles on a reclaim sale, so it won't
+  accrue — an intended full-wind-down effect, not a trapped balance.)
 - `receiveYieldERC20` credits the **measured received balance delta**, so a fee-on-transfer token cannot
   over-credit a grid.
 
