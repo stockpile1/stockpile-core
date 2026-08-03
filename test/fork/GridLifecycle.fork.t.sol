@@ -69,6 +69,11 @@ contract GridLifecycleForkTest is ForkBase {
         vm.prank(alice);
         ugm.buySeat(gridId, 0, 2 ether, 1 ether, 0);
 
+        // Creator's initial-sale proceeds are now pull-based: withdraw them so the balance-delta
+        // assertion below holds as under the old push model.
+        vm.prank(creator);
+        ugm.claimPayout(address(WBNB));
+
         Seat memory s = ugm.seatInfo(gridId, 0);
         assertEq(s.holder, alice);
         assertEq(s.price, 2 ether);
@@ -90,6 +95,11 @@ contract GridLifecycleForkTest is ForkBase {
         uint256 aliceBefore = WBNB.balanceOf(alice);
         vm.prank(bob);
         ugm.buySeat(gridId, 0, 3 ether, 5 ether, 0);
+
+        // Buyout proceeds + deposit refund are now pull-based: alice withdraws via claimPayout so
+        // the balance-delta assertion below holds as under the old push model.
+        vm.prank(alice);
+        ugm.claimPayout(address(WBNB));
 
         Seat memory s = ugm.seatInfo(gridId, 0);
         assertEq(s.holder, bob);
@@ -132,6 +142,11 @@ contract GridLifecycleForkTest is ForkBase {
         ugm.buySeat(gridId, 0, 1 ether, 10 ether, 0);
         vm.prank(bob);
         ugm.buySeat(gridId, 1, 1 ether, 10 ether, 0);
+
+        // Creator's initial-sale proceeds from the two buys above are now pull-based; drain them
+        // up front so the creator's claimPayout further down isolates exactly the 2 WBNB of yield.
+        vm.prank(creator);
+        ugm.claimPayout(address(WBNB));
 
         ugm.setApprovedAdapter(address(this), true);
         bytes32 assetHash = keccak256("grid-asset-1");

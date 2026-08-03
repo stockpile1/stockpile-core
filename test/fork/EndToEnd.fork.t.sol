@@ -169,6 +169,9 @@ contract EndToEndForkTest is ForkBase {
             vm.prank(alice);
             ugm.buySeat(mainGrid, 1, 6 ether, 100 ether, 0);
             assertEq(ugm.seatInfo(mainGrid, 1).holder, alice, "alice took over seat 1");
+            // bob's buyout proceeds + deposit refund are now pull-based: withdraw them in STOCK.
+            vm.prank(bob);
+            ugm.claimPayout(BscAddresses.STOCK);
             // bob refunded his ~100 STOCK deposit + sale proceeds (5 - 1% fee), minus tiny held-time tax.
             assertGt(stock.balanceOf(bob) - bobBefore, 100 ether, "bob refunded deposit + proceeds in STOCK");
         }

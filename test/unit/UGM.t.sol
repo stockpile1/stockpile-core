@@ -188,6 +188,11 @@ contract UGMUnitTest is Test {
         vm.prank(alice);
         ugm.buySeat(gridId, 0, 2 ether, 1 ether, 0); // pay 1e18 price, post 1e18 deposit
 
+        // Creator's initial-sale proceeds are now pull-based: withdraw them so the balance-delta
+        // assertions below (creator proceeds, ugm holdings) hold as under the old push model.
+        vm.prank(creator);
+        ugm.claimPayout(address(token));
+
         Seat memory s = ugm.seatInfo(gridId, 0);
         assertEq(s.holder, alice, "holder");
         assertTrue(s.seatEverSold, "seat marked sold");
@@ -272,6 +277,11 @@ contract UGMUnitTest is Test {
         uint256 aliceBefore = token.balanceOf(alice);
         vm.prank(bob);
         ugm.buySeat(gridId, 0, 3 ether, 5 ether, 0);
+
+        // Buyout proceeds + deposit refund are now pull-based: alice withdraws via claimPayout so
+        // the seller balance-delta assertion below holds as under the old push model.
+        vm.prank(alice);
+        ugm.claimPayout(address(token));
 
         Seat memory s = ugm.seatInfo(gridId, 0);
         assertEq(s.holder, bob, "holder is bob");
@@ -551,6 +561,11 @@ contract UGMUnitTest is Test {
         vm.prank(bob);
         ugm.buySeat(gridId, 1, 1 ether, 10 ether, 0);
 
+        // Creator's initial-sale proceeds from the two buys above are now pull-based; drain them
+        // up front so the creator's claimPayout further down isolates exactly the 2e18 of yield.
+        vm.prank(creator);
+        ugm.claimPayout(address(token));
+
         ugm.setApprovedAdapter(address(this), true);
         bytes32 assetHash = keccak256("grid-asset-1");
         ugm.registerAsset(gridId, assetHash);
@@ -619,6 +634,10 @@ contract UGMUnitTest is Test {
         vm.prank(alice);
         u.buySeat(gridId, 0, price, 10 ether, 0);
 
+        // Creator's initial-sale proceeds now accrue to `payouts` (pull-based); baseline them so
+        // the assertion below isolates the tax remainder alone.
+        uint256 creatorBefore = u.payouts(address(token), creator);
+
         uint256 elapsed = 1 days;
         vm.warp(block.timestamp + elapsed);
         uint256 owed = _taxOwed(price, TAX_BPS, elapsed);
@@ -627,7 +646,7 @@ contract UGMUnitTest is Test {
         u.pokeTax(gridId, 0);
         uint256 protocolShare = (owed * 2000) / BPS;
         assertEq(u.gridTaxRevenue(gridId), protocolShare, "protocol tax cut -> protocol bucket");
-        assertEq(u.payouts(address(token), creator), owed - protocolShare, "tax remainder -> creator claimable");
+        assertEq(u.payouts(address(token), creator) - creatorBefore, owed - protocolShare, "tax remainder -> creator claimable");
     }
 
     /// @notice On a buyout the creator earns `creatorSeatSaleBps` of the sale price (claimable),

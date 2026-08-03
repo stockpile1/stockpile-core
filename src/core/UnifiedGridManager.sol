@@ -330,7 +330,7 @@ contract UnifiedGridManager is IGrid, Ownable, ReentrancyGuard {
             uint256 protocolFee = (price * protocolSeatSaleBps) / BPS;
             if (protocolFee > 0) gridTaxRevenue[gridId] += protocolFee;
             uint256 creatorReceives = price - protocolFee;
-            if (creatorReceives > 0) tax.safeTransfer(c.creator, creatorReceives);
+            if (creatorReceives > 0) payouts[c.taxToken][c.creator] += creatorReceives; // pull-based (claimPayout)
         }
         tax.safeTransferFrom(msg.sender, address(this), depositAmount);
 
@@ -342,7 +342,8 @@ contract UnifiedGridManager is IGrid, Ownable, ReentrancyGuard {
     }
 
     /// @dev Buy out another holder at their declared price. Protocol cut -> protocol bucket,
-    ///      creator cut -> creator claimable, remainder + the seller's unspent deposit -> seller.
+    ///      creator cut -> creator claimable, remainder + the seller's unspent deposit -> seller claimable
+    ///      (pull-based: credited to `payouts`, withdrawn by the seller via `claimPayout`).
     function _buyout(
         uint256 gridId,
         uint256 seatId,
@@ -371,7 +372,8 @@ contract UnifiedGridManager is IGrid, Ownable, ReentrancyGuard {
     }
 
     /// @dev Split a buyout price: protocol cut -> protocol bucket, creator cut -> creator claimable,
-    ///      remainder + the seller's unspent deposit -> the (pushed) seller payout.
+    ///      remainder + the seller's unspent deposit -> the seller's claimable payout (pull-based,
+    ///      credited to `payouts` and withdrawn via `claimPayout` — no push in the buyout path).
     function _routeBuyout(uint256 gridId, uint256 price, address seller, uint256 sellerDeposit, GridConfig memory c)
         internal
     {
@@ -380,7 +382,7 @@ contract UnifiedGridManager is IGrid, Ownable, ReentrancyGuard {
         if (protocolFee > 0) gridTaxRevenue[gridId] += protocolFee;
         if (creatorFee > 0) payouts[c.taxToken][c.creator] += creatorFee;
         uint256 sellerTotal = (price - protocolFee - creatorFee) + sellerDeposit;
-        if (sellerTotal > 0) IERC20(c.taxToken).safeTransfer(seller, sellerTotal);
+        if (sellerTotal > 0) payouts[c.taxToken][seller] += sellerTotal; // pull-based (claimPayout)
     }
 
     /// @dev Reclaim a vacant seat during its Dutch window. The clearing price decays linearly
@@ -866,8 +868,14 @@ contract UnifiedGridManager is IGrid, Ownable, ReentrancyGuard {
         gridCreationPaused = false;
     }
 
-    /// @notice Deprecate a grid: blocks new acquisitions (`buySeat`) while leaving every exit
-    ///         path (withdrawDeposit / abandonSeat / claimYield / claimPayout / pokeTax) open.
+    /// @notice Deprecate a grid: blocks ALL `buySeat` — both new acquisitions and the Dutch reclaim
+    ///         of a forfeited/abandoned seat. Every ALREADY-SETTLED balance stays fully withdrawable:
+    ///         `withdrawDeposit` (your own unspent deposit), `claimYield` (your accrued yield), and
+    ///         `claimPayout` (proceeds already credited to you). Intentional consequence of a full
+    ///         wind-down: a seat still in its Dutch window at deprecation stays frozen (no reclaim
+    ///         buyer is admitted), so a forfeited holder's *contingent* clearing payout — which only
+    ///         settles when someone reclaims the seat — will not accrue. Deprecation stops new
+    ///         activity; it does not guarantee in-flight auctions complete.
     function deprecateGrid(uint256 gridId) external onlyOwner {
         require(gridId != 0 && gridId <= gridCount, "grid");
         gridDeprecated[gridId] = true;

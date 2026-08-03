@@ -73,6 +73,11 @@ contract FlapStockFlowForkTest is ForkBase {
         assertEq(ugm.seatInfo(gridId, 0).holder, alice);
         assertEq(ugm.seatInfo(gridId, 1).holder, bob);
 
+        // Creator's initial-sale proceeds from the two claims above are now pull-based; drain them
+        // up front so the creator's claimPayout below isolates exactly the 20 STOCK of yield.
+        vm.prank(creator);
+        ugm.claimPayout(BscAddresses.STOCK);
+
         // 2) Flap trading fees accrue in STOCK to the adapter (dividend/fee recipient);
         //    collectYield best-effort claims the dividendContract then sweeps the STOCK balance.
         deal(BscAddresses.STOCK, address(adapter), 40 ether);
@@ -102,6 +107,9 @@ contract FlapStockFlowForkTest is ForkBase {
         vm.prank(alice);
         ugm.buySeat(gridId, 1, 6 ether, 100 ether, 0);
         assertEq(ugm.seatInfo(gridId, 1).holder, alice, "seat taken over by alice");
+        // bob's buyout proceeds + deposit refund are now pull-based: withdraw them in STOCK.
+        vm.prank(bob);
+        ugm.claimPayout(BscAddresses.STOCK);
         // bob received his ~100 STOCK deposit refund + sale proceeds (5 STOCK - 1% fee), minus tiny tax.
         assertGt(stock.balanceOf(bob) - bobBefore, 100 ether, "bob refunded deposit + proceeds in STOCK");
     }

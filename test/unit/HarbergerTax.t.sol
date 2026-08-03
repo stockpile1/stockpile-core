@@ -227,6 +227,11 @@ contract HarbergerTaxTest is Test {
         vm.prank(bob);
         ugm.buySeat(gridId, 0, 3 ether, 5 ether, 0);
 
+        // Buyout proceeds + remaining-deposit refund are now pull-based: alice withdraws via
+        // claimPayout so the seller balance-delta assertion below holds as under the old push model.
+        vm.prank(alice);
+        ugm.claimPayout(address(token));
+
         Seat memory s = ugm.seatInfo(gridId, 0);
         assertEq(s.holder, bob, "holder is bob");
         assertEq(s.price, 3 ether, "bob's price");
