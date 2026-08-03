@@ -718,7 +718,10 @@ contract UnifiedGridManager is IGrid, Ownable, ReentrancyGuard {
         uint256 paid = _seatYieldPaid[gridId][seatId];
         if (acc <= paid) return;
         uint256 owed = (acc - paid) / ACC_PRECISION;
-        _seatYieldPaid[gridId][seatId] = acc;
+        // Advance `paid` by exactly what was credited (owed * ACC_PRECISION), NOT the full `acc`,
+        // so the truncated sub-unit remainder stays in the gap and accumulates into a future
+        // settlement instead of being stranded as unowned dust (COM-ROUNDING).
+        _seatYieldPaid[gridId][seatId] = paid + owed * ACC_PRECISION;
         if (owed > 0) payouts[yieldToken][to] += owed;
     }
 

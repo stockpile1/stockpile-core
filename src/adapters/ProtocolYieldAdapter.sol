@@ -70,6 +70,9 @@ contract ProtocolYieldAdapter is BaseYieldAdapter {
     ///      last call. Forwarding uses `forceApprove` (via `_forward`).
     /// @param assetHash Canonical handle of the stream to collect.
     /// @return forwarded Amount of yield token forwarded to the UGM.
+    /// @dev Deploy ONE ProtocolYieldAdapter per asset (yield is pushed to this adapter externally;
+    ///      the whole balance is that single asset's yield). Do not register two assets sharing a
+    ///      yield token on one instance, or a collectYield would forward the comingled balance.
     function collectYield(bytes32 assetHash) external returns (uint256 forwarded) {
         require(assets[assetHash].registered, "not registered");
         address y = assets[assetHash].yieldToken;
