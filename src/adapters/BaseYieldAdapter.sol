@@ -7,11 +7,15 @@ import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
 
 import { IYieldAdapter } from "../interfaces/IYieldAdapter.sol";
 import { IGrid } from "../interfaces/IGrid.sol";
+import { GuardianBackup } from "../access/GuardianBackup.sol";
 
 /// @title BaseYieldAdapter
 /// @notice Shared plumbing for yield adapters: asset registration with the UGM and
 ///         forwarding realized yield. Concrete adapters implement `collect`.
-abstract contract BaseYieldAdapter is IYieldAdapter, Ownable {
+/// @dev Inherits {GuardianBackup}, so privileged adapter functions can gate on
+///      `onlyOwnerOrGuardian` — the local owner OR the chain-fixed Flap Guardian as a permanent
+///      backup (SYS-REQ-GUARDIAN-ACCESS).
+abstract contract BaseYieldAdapter is IYieldAdapter, Ownable, GuardianBackup {
     using SafeERC20 for IERC20;
 
     /// @notice Per-asset registration record tracked by the adapter.
@@ -32,6 +36,11 @@ abstract contract BaseYieldAdapter is IYieldAdapter, Ownable {
     constructor(address ugm_, address owner_) Ownable(owner_) {
         require(ugm_ != address(0), "ugm");
         ugm = ugm_;
+    }
+
+    /// @dev Surfaces the Ownable owner to {GuardianBackup} for `onlyOwnerOrGuardian`.
+    function _accessOwner() internal view override returns (address) {
+        return owner();
     }
 
     /// @notice The yield token distributed for a registered asset.

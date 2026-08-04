@@ -2,7 +2,6 @@
 pragma solidity 0.8.26;
 
 import { Test } from "forge-std/Test.sol";
-import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
 import { UnifiedGridManager } from "../../src/core/UnifiedGridManager.sol";
 import { AntiSnipeHook } from "../../src/hooks/AntiSnipeHook.sol";
 import { CreateGridParams, Seat } from "../../src/libraries/GridTypes.sol";
@@ -75,7 +74,14 @@ contract AntiSnipeHookTest is Test {
 
     function test_SetClaimOpenAt_OnlyOwner() public {
         vm.prank(alice);
-        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        vm.expectRevert(bytes("not owner/guardian"));
         hook.setClaimOpenAt(gridId, 123);
+    }
+
+    /// @dev SYS-REQ-GUARDIAN-ACCESS: the chain-fixed Flap Guardian is a permanent backup caller.
+    function test_SetClaimOpenAt_GuardianIsBackup() public {
+        vm.prank(hook.guardian());
+        hook.setClaimOpenAt(gridId, 456);
+        assertEq(hook.claimOpenAt(gridId), 456, "guardian set the gate");
     }
 }

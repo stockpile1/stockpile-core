@@ -34,6 +34,11 @@ contract FlapYieldAdapter is BaseYieldAdapter {
     ///         token did not expose `dividendContract()` — the balance-sweep path still works).
     mapping(bytes32 => address) public dividendContractOf;
 
+    /// @notice Whether a yield token is already claimed by a currently-registered asset on this
+    ///         adapter. Enforces AT MOST ONE registered asset per yield token so `collectYield`'s
+    ///         whole-balance sweep is unambiguously attributable to a single grid (see below).
+    mapping(address => bool) public yieldTokenInUse;
+
     /// @notice Emitted when a Flap token's fee stream is wired to a grid.
     /// @param assetHash Canonical handle assigned to the stream.
     /// @param gridId The grid the fees are distributed to.
@@ -79,12 +84,18 @@ contract FlapYieldAdapter is BaseYieldAdapter {
     /// @param yieldToken The token fees are denominated in (the Flap token's quote/pair token,
     ///        e.g. STOCK).
     /// @return assetHash Canonical handle assigned to the registered stream.
+    /// @dev Rejects a second registration that shares an already-registered asset's `yieldToken`:
+    ///      because `collectYield` sweeps the adapter's WHOLE `yieldToken` balance, two assets
+    ///      sharing one yield token would let one grid's `collectYield` claim the other's balance
+    ///      (Flap's DividendPayingToken can PUSH dividends here without either `collectYield` being
+    ///      called). One asset per yield token keeps every sweep fully attributable to its own grid.
     function registerFlapToken(uint256 gridId, address flapToken, address yieldToken)
         external
-        onlyOwner
+        onlyOwnerOrGuardian
         returns (bytes32 assetHash)
     {
         require(flapToken != address(0), "flapToken");
+        require(!yieldTokenInUse[yieldToken], "yieldToken in use");
         assetHash = assetHashFor(flapToken);
         flapTokenOf[assetHash] = flapToken;
 
@@ -100,13 +111,17 @@ contract FlapYieldAdapter is BaseYieldAdapter {
         dividendContractOf[assetHash] = divc;
 
         _registerAsset(assetHash, gridId, yieldToken);
+        yieldTokenInUse[yieldToken] = true;
         emit FlapTokenRegistered(assetHash, gridId, flapToken, yieldToken, divc);
     }
 
     /// @notice Unwire a previously registered Flap fee stream from its grid.
+    /// @dev Frees the stream's yield token so it can be re-registered later.
     /// @param assetHash Canonical handle of the stream to withdraw.
-    function withdrawFlapToken(bytes32 assetHash) external onlyOwner {
+    function withdrawFlapToken(bytes32 assetHash) external onlyOwnerOrGuardian {
+        address y = assets[assetHash].yieldToken;
         _withdrawAsset(assetHash);
+        yieldTokenInUse[y] = false;
     }
 
     /// @notice Realize pending Flap fees for `assetHash` and forward them to the UGM.
@@ -131,7 +146,9 @@ contract FlapYieldAdapter is BaseYieldAdapter {
         // (2) Retained secondary: graduated-LP vault fees (unconfirmed selector, best-effort).
         try vaultPortal.claim(flapTokenOf[assetHash]) returns (uint256) {} catch {}
 
-        // (3) Authoritative: forward whatever yield-token balance actually landed here.
+        // (3) Authoritative: forward whatever yield-token balance actually landed here. Safe as a
+        //     whole-balance sweep because `registerFlapToken` enforces one asset per yield token, so
+        //     the entire `y` balance belongs to this asset's grid (no cross-grid comingling).
         address y = assets[assetHash].yieldToken;
         forwarded = _forward(assetHash, IERC20(y).balanceOf(address(this)));
         emit Harvested(assetHash, forwarded);

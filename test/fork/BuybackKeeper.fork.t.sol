@@ -11,7 +11,6 @@ import {
     IPancakeV3Pool
 } from "../../src/interfaces/external/IPancakeV3.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
 
 /// @notice BSC-mainnet fork test for `GenericBuybackKeeper` against the REAL PancakeSwap V3
 ///         SwapRouter on BSC. TAKEOVER is a token WE deploy, so no WBNB/TAKEOVER pool exists
@@ -112,7 +111,7 @@ contract BuybackKeeperForkTest is ForkBase {
     function test_SetReceiver_OnlyOwner() public {
         address stranger = makeAddr("stranger");
         vm.prank(stranger);
-        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
+        vm.expectRevert(bytes("not owner/guardian"));
         keeper.setReceiver(stranger);
 
         address newReceiver = makeAddr("newReceiver");
@@ -124,7 +123,7 @@ contract BuybackKeeperForkTest is ForkBase {
     function test_Convert_OnlyOwner_RevertsForStranger() public {
         address stranger = makeAddr("stranger");
         vm.prank(stranger);
-        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
+        vm.expectRevert(bytes("not owner/guardian"));
         keeper.convert(BscAddresses.WBNB, FEE, 0);
     }
 }

@@ -66,7 +66,7 @@ contract PancakeV3YieldAdapter is BaseYieldAdapter {
     /// @return assetHash     Canonical handle assigned to the registered position.
     function registerPosition(uint256 gridId, uint256 tokenId, address yieldTokenSide, uint24 swapFee)
         external
-        onlyOwner
+        onlyOwnerOrGuardian
         returns (bytes32 assetHash)
     {
         require(positionManager.ownerOf(tokenId) == address(this), "NFT not held");
@@ -83,7 +83,7 @@ contract PancakeV3YieldAdapter is BaseYieldAdapter {
     /// @notice Unwire a position from its grid and return the NFT.
     /// @param assetHash Canonical handle of the position to withdraw.
     /// @param to        Recipient of the returned position NFT.
-    function withdrawPosition(bytes32 assetHash, address to) external onlyOwner {
+    function withdrawPosition(bytes32 assetHash, address to) external onlyOwnerOrGuardian {
         _withdrawAsset(assetHash);
         positionManager.safeTransferFrom(address(this), to, tokenIdOf[assetHash]);
     }
@@ -136,7 +136,7 @@ contract PancakeV3YieldAdapter is BaseYieldAdapter {
     /// @param assetHash Canonical handle of the position to harvest.
     /// @param minOut    Minimum yield token out of the internal non-yield-side swap.
     /// @return Amount of yield token forwarded to the UGM.
-    function harvestWithMinOut(bytes32 assetHash, uint256 minOut) external onlyOwner returns (uint256) {
+    function harvestWithMinOut(bytes32 assetHash, uint256 minOut) external onlyOwnerOrGuardian returns (uint256) {
         return _harvest(assetHash, minOut, true);
     }
 

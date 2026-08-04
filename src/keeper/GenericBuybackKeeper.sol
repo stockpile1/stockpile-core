@@ -6,6 +6,7 @@ import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.s
 import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
 
 import { IPancakeV3SwapRouter } from "../interfaces/external/IPancakeV3.sol";
+import { GuardianBackup } from "../access/GuardianBackup.sol";
 
 /// @title GenericBuybackKeeper
 /// @notice Permissionless keeper that converts accrued tax/protocol revenue into
@@ -15,7 +16,7 @@ import { IPancakeV3SwapRouter } from "../interfaces/external/IPancakeV3.sol";
 ///      UGM.withdrawTaxRevenue), then the owner (guardian/keeper) triggers `convert`.
 ///      `convert` is `onlyOwner`: it swaps with a caller-supplied `minAmountOut`, so a
 ///      permissionless caller could pass 0 and let an attacker sandwich the swap (COM-MEV).
-contract GenericBuybackKeeper is Ownable {
+contract GenericBuybackKeeper is Ownable, GuardianBackup {
     using SafeERC20 for IERC20;
 
     IPancakeV3SwapRouter public immutable swapRouter;
@@ -45,9 +46,14 @@ contract GenericBuybackKeeper is Ownable {
         receiver = receiver_;
     }
 
+    /// @dev Surfaces the Ownable owner to {GuardianBackup} for `onlyOwnerOrGuardian`.
+    function _accessOwner() internal view override returns (address) {
+        return owner();
+    }
+
     /// @notice Update the recipient of bought-back TAKEOVER.
     /// @param receiver_ The new receiver address (must be non-zero).
-    function setReceiver(address receiver_) external onlyOwner {
+    function setReceiver(address receiver_) external onlyOwnerOrGuardian {
         require(receiver_ != address(0), "zero");
         receiver = receiver_;
         emit ReceiverSet(receiver_);
@@ -61,7 +67,7 @@ contract GenericBuybackKeeper is Ownable {
     /// @return amountOut Amount of TAKEOVER sent to the receiver.
     function convert(address tokenIn, uint24 fee, uint256 minAmountOut)
         external
-        onlyOwner
+        onlyOwnerOrGuardian
         returns (uint256 amountOut)
     {
         require(tokenIn != takeover, "tokenIn==TAKEOVER");
@@ -88,7 +94,7 @@ contract GenericBuybackKeeper is Ownable {
     /// @param token The ERC20 to transfer out.
     /// @param to The recipient of the rescued tokens.
     /// @param amount Amount of `token` to transfer.
-    function rescue(address token, address to, uint256 amount) external onlyOwner {
+    function rescue(address token, address to, uint256 amount) external onlyOwnerOrGuardian {
         IERC20(token).safeTransfer(to, amount);
     }
 }

@@ -50,7 +50,7 @@ contract ProtocolYieldAdapter is BaseYieldAdapter {
     /// @return assetHash Canonical handle for the registered stream.
     function registerFeeStream(uint256 gridId, address yieldToken)
         external
-        onlyOwner
+        onlyOwnerOrGuardian
         returns (bytes32 assetHash)
     {
         assetHash = assetHashFor(gridId, yieldToken);
@@ -60,7 +60,7 @@ contract ProtocolYieldAdapter is BaseYieldAdapter {
 
     /// @notice Unwire a previously registered protocol-fee stream from its grid.
     /// @param assetHash Canonical handle of the stream to withdraw.
-    function withdrawFeeStream(bytes32 assetHash) external onlyOwner {
+    function withdrawFeeStream(bytes32 assetHash) external onlyOwnerOrGuardian {
         _withdrawAsset(assetHash);
         emit FeeStreamWithdrawn(assetHash);
     }

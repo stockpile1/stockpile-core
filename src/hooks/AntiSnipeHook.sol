@@ -4,6 +4,7 @@ pragma solidity 0.8.26;
 import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
 import { IGridHooksV23 } from "../interfaces/IGridHooksV23.sol";
 import { IHookDescriptor, HookCallbacks } from "../interfaces/IHookDescriptor.sol";
+import { GuardianBackup } from "../access/GuardianBackup.sol";
 
 /// @title AntiSnipeHook
 /// @notice Example UGM v2.3 governance module: gates initial seat claims until a
@@ -13,7 +14,7 @@ import { IHookDescriptor, HookCallbacks } from "../interfaces/IHookDescriptor.so
 ///      grid via `UGM.setGridGovernanceModule`. All callbacks stay within the 150k gas cap.
 ///      Also implements `IHookDescriptor` (submit-flow identity surface) — metadata only, it
 ///      does not touch the gating logic.
-contract AntiSnipeHook is IGridHooksV23, IHookDescriptor, Ownable {
+contract AntiSnipeHook is IGridHooksV23, IHookDescriptor, Ownable, GuardianBackup {
     /// @notice Stable kind tag for this hook (see IHookDescriptor.hookKind).
     bytes32 public constant HOOK_KIND = keccak256("ANTI_SNIPE");
     /// @notice Implementation version of this hook kind (see IHookDescriptor.hookVersion).
@@ -30,10 +31,15 @@ contract AntiSnipeHook is IGridHooksV23, IHookDescriptor, Ownable {
     /// @param owner_ The owner authorized to set per-grid claim-open timestamps.
     constructor(address owner_) Ownable(owner_) { }
 
+    /// @dev Surfaces the Ownable owner to {GuardianBackup} for `onlyOwnerOrGuardian`.
+    function _accessOwner() internal view override returns (address) {
+        return owner();
+    }
+
     /// @notice Set the timestamp at/after which seat claims open for a grid.
     /// @param gridId The grid to configure.
     /// @param openAt The unix timestamp when claims become allowed (0 = always open).
-    function setClaimOpenAt(uint256 gridId, uint64 openAt) external onlyOwner {
+    function setClaimOpenAt(uint256 gridId, uint64 openAt) external onlyOwnerOrGuardian {
         claimOpenAt[gridId] = openAt;
         emit ClaimOpenAtSet(gridId, openAt);
     }
