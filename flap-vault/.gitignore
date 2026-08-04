@@ -1,0 +1,10 @@
+# Foundry build artifacts
+out/
+cache/
+broadcast/
+
+# Secrets — never commit
+.env
+*.env
+
+# Note: lib/ is tracked via git submodules (see .gitmodules), so it is NOT ignored here.
