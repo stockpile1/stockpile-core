@@ -14,7 +14,14 @@ fs_permissions = [{ access = "read", path = "./" }, { access = "read-write", pat
 
 remappings = [
     "forge-std/=lib/forge-std/src/",
+    # Core (everything except the vault subtrees) — OpenZeppelin v5.
     "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+    # Flap vault (src/vault/ + test/vault/) — OpenZeppelin v4.9.6, context-scoped so its bare
+    # `@openzeppelin/...` prefix resolves to v4 ONLY inside the vault dirs and never touches the core.
+    "src/vault/:@openzeppelin/=lib/openzeppelin-contracts-v4/contracts/",
+    "src/vault/:@openzeppelin-contracts-upgradeable/=lib/openzeppelin-contracts-upgradeable-v4/contracts/",
+    "test/vault/:@openzeppelin/=lib/openzeppelin-contracts-v4/contracts/",
+    "test/vault/:@openzeppelin-contracts-upgradeable/=lib/openzeppelin-contracts-upgradeable-v4/contracts/",
 ]
 
 # BSC mainnet fork target (chainId 56). Override via env: BSC_RPC_URL

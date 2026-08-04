@@ -5,10 +5,18 @@ The **core contract the Stockpile vault forwards funds into**, and therefore par
 **`UnifiedGridManager`** (UGM), which runs the Harberger seat market and holds/routes the pooled funds.
 This repo is provided so the UGM is auditable alongside the vault.
 
-- **Vault contracts:** https://github.com/stockpile1/Stockpile · **Frontend:** https://github.com/stockpile1/stockpile-vault-ui
-- Solidity 0.8.x, OpenZeppelin **v5** (submodule). Build: `forge build` · Test: `forge test` (BSC fork tests need `BSC_RPC_URL`).
+- **Frontend:** https://github.com/stockpile1/stockpile-vault-ui
+- Build: `forge build` · Test: `forge test` (BSC fork tests need `BSC_RPC_URL`).
 - **Audit scope:** [`src/core/UnifiedGridManager.sol`](src/core/UnifiedGridManager.sol) + its
   `src/interfaces/*`, `src/libraries/{GridTypes,HarbergerMath}.sol`. (The token/adapters/hooks are secondary.)
+
+### Layout (one repo, one `src/`)
+| Path | What | OpenZeppelin |
+|---|---|---|
+| `src/` (core, adapters, keeper, hooks, token, access) | Harberger grid engine + fee-routing adapters | **v5** (`@openzeppelin/contracts/…`) |
+| [`src/vault/`](src/vault) | the Flap-submittable **StockpileBasketVault** + StockBasket/factory + immutable Flap prelude | **v4.9.6** (`@openzeppelin/…`, vendored under `lib/openzeppelin-contracts-v4*`) |
+
+The two need different OpenZeppelin versions, so `foundry.toml` uses **context-scoped remappings** (`src/vault/:@openzeppelin/=…v4`) — one `forge build`/`forge test` compiles both. The vault code is byte-for-byte the audited version; only its build wiring moved.
 
 ## Deployed (same address on both chains — same deployer + CREATE nonce)
 | Chain | UnifiedGridManager | Verified |
