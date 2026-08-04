@@ -75,7 +75,7 @@ contract DeployVaultFactory is Script {
                 address(new MockMintableERC20("SPCXB-T", "SPCXB-T", 18)),
                 address(new MockMintableERC20("NVDAB-T", "NVDAB-T", 18)),
                 address(new MockMintableERC20("AAPLB-T", "AAPLB-T", 18)),
-                address(new MockMintableERC20("SPYB-T", "SPYB-T", 18))
+                address(new MockMintableERC20("GMEon-T", "GMEon-T", 18))
             ];
         } else {
             revert("unsupported chain: run on 56 or 97, or set WBNB/USDT/UGM/ROUTER explicitly");
@@ -100,7 +100,7 @@ contract DeployVaultFactory is Script {
         console2.log("  wbnbUsdtFee:     ", uint256(fee));
 
         if (block.chainid == 97) {
-            string[4] memory syms = ["SPCXB-T", "NVDAB-T", "AAPLB-T", "SPYB-T"];
+            string[4] memory syms = ["SPCXB-T", "NVDAB-T", "AAPLB-T", "GMEon-T"];
             console2.log("-- testnet mock stocks (basket order) --");
             for (uint256 i = 0; i < 4; i++) {
                 console2.log(string.concat("  STOCK", vm.toString(i), " (", syms[i], "):"), stocks[i]);
@@ -114,7 +114,7 @@ contract DeployVaultFactory is Script {
         } else {
             // Mainnet: the launch's VaultDataV1 basket uses these 4 real stocks (see StockConfig).
             address[4] memory real = StockConfig.mainnetStocks();
-            string[4] memory syms = ["SPCXB", "NVDAB", "AAPLB", "SPYB"];
+            string[4] memory syms = ["SPCXB", "NVDAB", "AAPLB", "GMEon"];
             console2.log("-- basket stocks for the launch (StockConfig, mainnet) --");
             for (uint256 i = 0; i < 4; i++) {
                 console2.log(string.concat("  ", syms[i], ":"), real[i]);

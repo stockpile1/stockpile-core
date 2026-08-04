@@ -58,7 +58,7 @@ Any input can be overridden without editing the script:
 ## 2. Launch a vault-backed token (testnet)
 
 After step 1, export the addresses it logged, then run the launch. The basket is the **4 stocks**
-(`SPCXB, NVDAB, AAPLB, SPYB` — see [`StockConfig.sol`](StockConfig.sol) for the
+(`SPCXB, NVDAB, AAPLB, GMEon` — see [`StockConfig.sol`](StockConfig.sol) for the
 mainnet addresses + fee tiers + weights):
 
 ```bash

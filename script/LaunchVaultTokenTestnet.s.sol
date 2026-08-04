@@ -70,7 +70,7 @@ contract LaunchVaultTokenTestnet is Script, VanityHelper {
 
     // Resolved deployment (from env, or bootstrapped for the dry-run).
     address internal factory;
-    address[4] internal stocks; // the 4-stock basket (SPCXB, NVDAB, AAPLB, SPYB) — see {StockConfig}
+    address[4] internal stocks; // the 4-stock basket (SPCXB, NVDAB, AAPLB, GMEon) — see {StockConfig}
     bool internal bootstrapped;
 
     function run() external {
@@ -149,7 +149,7 @@ contract LaunchVaultTokenTestnet is Script, VanityHelper {
         stocks[0] = address(new MockMintableERC20("SPCXB-T", "SPCXB-T", 18));
         stocks[1] = address(new MockMintableERC20("NVDAB-T", "NVDAB-T", 18));
         stocks[2] = address(new MockMintableERC20("AAPLB-T", "AAPLB-T", 18));
-        stocks[3] = address(new MockMintableERC20("SPYB-T", "SPYB-T", 18));
+        stocks[3] = address(new MockMintableERC20("GMEon-T", "GMEon-T", 18));
         factory =
             address(new StockpileBasketVaultFactory(TWBNB, address(usdt), UGM, address(router), WBNB_USDT_FEE));
     }

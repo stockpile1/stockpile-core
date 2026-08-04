@@ -85,7 +85,7 @@ Rule 008 conformance: callback validates `msg.sender == triggerService()` (chain
 
 `MAX_TRIGGER_STOCKS = 5` was therefore introduced and `scheduleDistribute` rejects vaults with more legs, so the service never burns a fee on a callback that cannot fit. **A 7-stock basket cannot use the triggered path** and must fall back to the keeper path (`distribute` / `distributeUniform`), which has no gas cap — which reinstates the Guardian dependency for those vaults. This is a product decision that needs an explicit answer, not a default.
 
-**Basket cut to 4 legs.** `StockConfig` was reduced from 7 stocks to **SPCXB, NVDAB, AAPLB, SPYB** (equal 2,500 bps weights) so a distribute fits the callback budget with ~20% headroom. QQQB, TSLAB and XAUt were dropped. `DeployVaultFactory.s.sol` and `LaunchVaultTokenTestnet.s.sol` were updated to match (`STOCK0..STOCK3`).
+**Basket cut to 4 legs.** `StockConfig` was reduced from 7 stocks to **SPCXB, NVDAB, AAPLB, GMEon** (equal 2,500 bps weights) so a distribute fits the callback budget with ~20% headroom. QQQB, SPYB, TSLAB and XAUt were dropped. All four legs' USDT pools were verified live on BSC at the 2500 tier with non-trivial liquidity — which matters because the triggered path swaps with a zero floor. `DeployVaultFactory.s.sol` and `LaunchVaultTokenTestnet.s.sol` were updated to match (`STOCK0..STOCK3`).
 
 ### Post-audit change: Flap reviewer findings (report v8)
 
