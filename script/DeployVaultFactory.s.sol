@@ -55,7 +55,7 @@ contract DeployVaultFactory is Script {
         address wbnb;
         address usdt;
         address router;
-        address[7] memory stocks; // populated on testnet (the 7-stock basket for a later LaunchVaultToken)
+        address[4] memory stocks; // populated on testnet (the 4-stock basket for a later LaunchVaultToken)
 
         vm.startBroadcast(pk);
 
@@ -70,15 +70,12 @@ contract DeployVaultFactory is Script {
             if (usdt == address(0)) usdt = address(new MockMintableERC20("USDT-T", "USDT-T", 18));
             router = vm.envOr("ROUTER", address(0));
             if (router == address(0)) router = address(new MockV3Router());
-            // The 7-stock basket (mock tokens on testnet), in canonical StockConfig order.
+            // The 4-stock basket (mock tokens on testnet), in canonical StockConfig order.
             stocks = [
                 address(new MockMintableERC20("SPCXB-T", "SPCXB-T", 18)),
-                address(new MockMintableERC20("QQQB-T", "QQQB-T", 18)),
                 address(new MockMintableERC20("NVDAB-T", "NVDAB-T", 18)),
-                address(new MockMintableERC20("SPYB-T", "SPYB-T", 18)),
-                address(new MockMintableERC20("TSLAB-T", "TSLAB-T", 18)),
                 address(new MockMintableERC20("AAPLB-T", "AAPLB-T", 18)),
-                address(new MockMintableERC20("XAUt-T", "XAUt-T", 18))
+                address(new MockMintableERC20("SPYB-T", "SPYB-T", 18))
             ];
         } else {
             revert("unsupported chain: run on 56 or 97, or set WBNB/USDT/UGM/ROUTER explicitly");
@@ -103,24 +100,23 @@ contract DeployVaultFactory is Script {
         console2.log("  wbnbUsdtFee:     ", uint256(fee));
 
         if (block.chainid == 97) {
-            string[7] memory syms =
-                ["SPCXB-T", "QQQB-T", "NVDAB-T", "SPYB-T", "TSLAB-T", "AAPLB-T", "XAUt-T"];
+            string[4] memory syms = ["SPCXB-T", "NVDAB-T", "AAPLB-T", "SPYB-T"];
             console2.log("-- testnet mock stocks (basket order) --");
-            for (uint256 i = 0; i < 7; i++) {
+            for (uint256 i = 0; i < 4; i++) {
                 console2.log(string.concat("  STOCK", vm.toString(i), " (", syms[i], "):"), stocks[i]);
             }
             console2.log("");
             console2.log("NEXT (LaunchVaultTokenTestnet), export:");
             console2.log("  export FACTORY=", address(factory));
-            for (uint256 i = 0; i < 7; i++) {
+            for (uint256 i = 0; i < 4; i++) {
                 console2.log(string.concat("  export STOCK", vm.toString(i), "="), stocks[i]);
             }
         } else {
-            // Mainnet: the launch's VaultDataV1 basket uses these 7 real stocks (see StockConfig).
-            address[7] memory real = StockConfig.mainnetStocks();
-            string[7] memory syms = ["SPCXB", "QQQB", "NVDAB", "SPYB", "TSLAB", "AAPLB", "XAUt"];
+            // Mainnet: the launch's VaultDataV1 basket uses these 4 real stocks (see StockConfig).
+            address[4] memory real = StockConfig.mainnetStocks();
+            string[4] memory syms = ["SPCXB", "NVDAB", "AAPLB", "SPYB"];
             console2.log("-- basket stocks for the launch (StockConfig, mainnet) --");
-            for (uint256 i = 0; i < 7; i++) {
+            for (uint256 i = 0; i < 4; i++) {
                 console2.log(string.concat("  ", syms[i], ":"), real[i]);
             }
         }

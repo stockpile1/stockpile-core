@@ -32,7 +32,7 @@ forge script script/DeployVaultFactory.s.sol --rpc-url $RPC
 # broadcast
 forge script script/DeployVaultFactory.s.sol --rpc-url $RPC --broadcast --legacy
 ```
-Copy the logged `factory` + `STOCK0/1/2` addresses — the launch script (step 2) reads them from env.
+Copy the logged `factory` + `STOCK0..STOCK3` addresses — the launch script (step 2) reads them from env.
 
 ### Mainnet (chainId 56)
 Uses **real** WBNB, USDT, PancakeSwap V3 SwapRouter, and the live UGM (`0xaA40Da…Cbd1`).
@@ -57,14 +57,14 @@ Any input can be overridden without editing the script:
 
 ## 2. Launch a vault-backed token (testnet)
 
-After step 1, export the addresses it logged, then run the launch. The basket is the **7 stocks**
-(`SPCXB, QQQB, NVDAB, SPYB, TSLAB, AAPLB, XAUt` — see [`StockConfig.sol`](StockConfig.sol) for the
+After step 1, export the addresses it logged, then run the launch. The basket is the **4 stocks**
+(`SPCXB, NVDAB, AAPLB, SPYB` — see [`StockConfig.sol`](StockConfig.sol) for the
 mainnet addresses + fee tiers + weights):
 
 ```bash
 export PRIVATE_KEY=0x…
 export FACTORY=0x…      # logged by DeployVaultFactory
-export STOCK0=0x… STOCK1=0x… STOCK2=0x… STOCK3=0x… STOCK4=0x… STOCK5=0x… STOCK6=0x…   # the 7 stocks, in order
+export STOCK0=0x… STOCK1=0x… STOCK2=0x… STOCK3=0x…   # the 4 stocks, in order
 export FUND_WEI=20000000000000000   # optional: initial BNB to fund the launch (default 0.02)
 
 RPC=https://data-seed-prebsc-1-s1.bnbchain.org:8545

@@ -187,7 +187,16 @@ contract FlapVaultBackedLaunchForkTest is FlapBSCFixture {
 
         bytes32 assetHash = vault.assetHash();
         vm.prank(FLAP_GUARDIAN); // == _getGuardian() on chainid 56 // the mainnet Flap Guardian — proves guardian-gated distribute
+        uint256 gasBefore = gasleft();
         uint256 basketMinted = vault.distributeUniform(0, block.timestamp + 300);
+        uint256 distributeGas = gasBefore - gasleft();
+
+        // Rule 008 §4: the Flap Trigger Service hard-caps every callback at 2,000,000 gas. This is the
+        // REAL cost against live PancakeSwap V3 pools (the unit tests' mock router is far cheaper), so it
+        // is the number that decides how many stock legs can run in one triggered distribute.
+        emit log_named_uint("REAL distribute gas (3 legs, live V3)", distributeGas);
+        emit log_named_uint("REAL gas per stock leg (approx)", distributeGas / 3);
+        assertLt(distributeGas, 2_000_000, "3-leg distribute must fit the Trigger Service 2M callback cap");
 
         // Commission skimmed to treasury in WBNB (>0, never above the 6% cap on the gross).
         uint256 commission = IERC20(WBNB).balanceOf(treasury);

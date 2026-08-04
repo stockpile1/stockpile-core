@@ -27,6 +27,17 @@ contract PancakeV3YieldAdapter is BaseYieldAdapter {
     mapping(bytes32 => uint256) public tokenIdOf;
     mapping(bytes32 => uint24) public swapFeeOf; // pool fee used to convert the non-yield side
 
+    /// @notice Whether a yield token is already claimed by a currently-registered position on this
+    ///         adapter. Enforces AT MOST ONE registered position per yield token, mirroring
+    ///         {FlapYieldAdapter.yieldTokenInUse}.
+    /// @dev    `_harvest` forwards the adapter's ENTIRE balance of the registered yield token, so the
+    ///         sweep is only attributable to one grid if no second position can claim the same token.
+    ///         Without this, two positions with overlapping token sets cross-contaminate: position A's
+    ///         uncollected NON-yield side accumulates in the adapter awaiting `harvestWithMinOut`, and a
+    ///         later permissionless `collectYield(B)` — where that same token is B's YIELD side — sweeps
+    ///         A's residual into grid B, permanently losing it for grid A's seat holders.
+    mapping(address => bool) public yieldTokenInUse;
+
     /// @notice Emitted when a V3 position is wired to a grid.
     /// @param assetHash Canonical handle assigned to the position.
     /// @param gridId The grid the position's fees are distributed to.
@@ -72,19 +83,26 @@ contract PancakeV3YieldAdapter is BaseYieldAdapter {
         require(positionManager.ownerOf(tokenId) == address(this), "NFT not held");
         (,, address token0, address token1,,,,,,,,) = positionManager.positions(tokenId);
         require(yieldTokenSide == token0 || yieldTokenSide == token1, "yield side");
+        // One position per yield token: `_harvest` sweeps the WHOLE balance of it, so a second claimant
+        // would make that sweep ambiguous and let one grid drain another's residual (see yieldTokenInUse).
+        require(!yieldTokenInUse[yieldTokenSide], "yieldToken in use");
 
         assetHash = assetHashFor(tokenId);
         tokenIdOf[assetHash] = tokenId;
         swapFeeOf[assetHash] = swapFee;
         _registerAsset(assetHash, gridId, yieldTokenSide);
+        yieldTokenInUse[yieldTokenSide] = true;
         emit PositionRegistered(assetHash, gridId, tokenId, yieldTokenSide);
     }
 
     /// @notice Unwire a position from its grid and return the NFT.
     /// @param assetHash Canonical handle of the position to withdraw.
     /// @param to        Recipient of the returned position NFT.
+    /// @dev Frees the position's yield token so it can be claimed by a future registration.
     function withdrawPosition(bytes32 assetHash, address to) external onlyOwnerOrGuardian {
+        address y = assets[assetHash].yieldToken;
         _withdrawAsset(assetHash);
+        yieldTokenInUse[y] = false;
         positionManager.safeTransferFrom(address(this), to, tokenIdOf[assetHash]);
     }
 

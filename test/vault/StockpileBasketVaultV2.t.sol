@@ -13,6 +13,7 @@ import {MockMintableERC20} from "./mocks/MockMintableERC20.sol";
 import {MockUGM} from "./mocks/MockUGM.sol";
 import {MockV3Router} from "./mocks/MockV3Router.sol";
 import {MockTaxToken} from "./mocks/MockTaxToken.sol";
+import {MockTriggerService} from "./mocks/MockTriggerService.sol";
 
 /// @title StockpileBasketVaultV2 unit tests (Flap rules 001-009 conformance)
 /// @notice Runs on chainId 97 (BSC testnet) so VaultBaseV2's chain-fixed `_getVaultPortal()` /
@@ -149,6 +150,16 @@ contract StockpileBasketVaultV2Test is Test {
 
     function _minOut3() internal pure returns (uint256[] memory m) {
         m = new uint256[](3);
+    }
+
+    /// @dev The vault resolves the Trigger Service from `block.chainid` (chain-fixed, like the Guardian),
+    ///      so the mock has to live AT that address. Etch its code there and use it from there.
+    function _installTriggerService() internal returns (MockTriggerService ts) {
+        address fixedAddr = 0x560E9830926C9e0EB98a59c6b9902383Fc0D9Eb2; // chainId 97
+        vm.etch(fixedAddr, address(new MockTriggerService()).code);
+        ts = MockTriggerService(payable(fixedAddr));
+        ts.setFee(0.001 ether);
+        ts.setMaxCallbackGas(2_000_000);
     }
 
     // ── initialize wires config; setupMarket wires basket + grid ────────────────
@@ -402,6 +413,293 @@ contract StockpileBasketVaultV2Test is Test {
         assertEq(v.lastDistribute(), block.timestamp, "gate advances only on a productive round");
     }
 
+    // ── Guardian rescue: receive() forward switch (SYS-REQ-RESCUE-MECHANISM) ────
+
+    function testAutoForwardDefaultsOff() public {
+        StockpileBasketVaultV2 v = _newVault(address(new MockTaxToken(100)), 600, 0);
+        assertFalse(v.autoForwardEnabled(), "forwarding off until the Guardian arms it");
+        assertEq(v.forwardAddress(), address(0), "no destination by default");
+
+        vm.deal(address(this), 1 ether);
+        (bool ok,) = address(v).call{value: 1 ether}("");
+        assertTrue(ok, "receive accepts");
+        assertEq(address(v).balance, 1 ether, "BNB accrues on the vault as before");
+    }
+
+    /// @dev The point of the switch: once armed, FUTURE inflows are redirected on arrival, so the Guardian
+    ///      does not have to re-sweep every new tax payment by hand during an incident.
+    function testAutoForwardRedirectsIncomingBnb() public {
+        StockpileBasketVaultV2 v = _newVault(address(new MockTaxToken(100)), 600, 0);
+        address safe = makeAddr("safe");
+
+        vm.prank(GUARDIAN);
+        v.setAutoForward(true, safe);
+
+        vm.deal(address(this), 3 ether);
+        (bool ok,) = address(v).call{value: 3 ether}("");
+        assertTrue(ok, "receive still succeeds");
+        assertEq(safe.balance, 3 ether, "inflow redirected to the safe address");
+        assertEq(address(v).balance, 0, "nothing retained on the vault");
+
+        // Disarming restores normal accrual.
+        vm.prank(GUARDIAN);
+        v.setAutoForward(false, address(0));
+        vm.deal(address(this), 1 ether);
+        (ok,) = address(v).call{value: 1 ether}("");
+        assertTrue(ok, "receive succeeds");
+        assertEq(address(v).balance, 1 ether, "accrues again once disarmed");
+    }
+
+    /// @dev Rule 005: `receive()` must never revert on a gas-limited send. A destination that reverts (or
+    ///      burns gas) must not break the fee transfer — the BNB just stays put, Guardian-recoverable.
+    function testAutoForwardFailureNeverRevertsReceive() public {
+        StockpileBasketVaultV2 v = _newVault(address(new MockTaxToken(100)), 600, 0);
+        address rejecting = address(new RejectsBnb());
+
+        vm.prank(GUARDIAN);
+        v.setAutoForward(true, rejecting);
+
+        vm.deal(address(this), 2 ether);
+        uint256 gasBefore = gasleft();
+        (bool ok,) = address(v).call{value: 2 ether}("");
+        uint256 used = gasBefore - gasleft();
+
+        assertTrue(ok, "receive must not revert when the forward fails");
+        assertEq(address(v).balance, 2 ether, "BNB retained, still recoverable");
+        assertLt(used, 1_000_000, "still far inside the Rule 005 budget");
+    }
+
+    function testSetAutoForwardGuardianOnlyAndNonZero() public {
+        StockpileBasketVaultV2 v = _newVault(address(new MockTaxToken(100)), 600, 0);
+
+        vm.prank(makeAddr("rando"));
+        vm.expectRevert(bytes(unicode"Only Guardian / 仅限 Guardian"));
+        v.setAutoForward(true, makeAddr("safe"));
+
+        vm.prank(GUARDIAN);
+        vm.expectRevert(bytes(unicode"Zero address / 零地址"));
+        v.setAutoForward(true, address(0));
+    }
+
+    // ── Flap Trigger Service integration (Rule 008) ─────────────────────────────
+
+    /// @dev The whole point of the integration: NOBODY needs to be a keeper. An arbitrary EOA arms the
+    ///      schedule, the service calls back, and the distribution happens.
+    function testTriggerServiceEndToEnd() public {
+        MockTriggerService ts = _installTriggerService();
+        StockpileBasketVaultV2 v = _newVault(address(new MockTaxToken(100)), 1000, 0);
+        _setupAndRegister(v);
+
+        vm.deal(address(v), 10 ether);
+
+        vm.prank(makeAddr("anyone")); // permissionless
+        uint256 requestId = v.scheduleDistribute();
+
+        assertTrue(v.triggerPending(), "request outstanding");
+        assertEq(v.pendingRequestId(), requestId, "id recorded");
+        assertEq(ts.feesCollected(), 0.001 ether, "fee paid from vault BNB");
+
+        assertTrue(ts.fire(requestId), "callback succeeded");
+
+        // TWO service fees left the vault before the swaps: the initial arm, and the re-arm the callback
+        // pays FIRST (deliberately, so the fee comes out of native BNB before _distribute wraps it all).
+        uint256 expCommission = ((10 ether - 0.002 ether) * 6) / 100;
+        assertEq(wbnb.balanceOf(treasury), expCommission, "commission skimmed");
+        assertGt(ugm.yieldByAsset(v.assetHash()), 0, "grid fed with no keeper involved");
+        // Re-armed for the next cycle, and the new id is outstanding.
+        assertTrue(v.triggerPending(), "re-armed");
+        assertEq(v.pendingRequestId(), requestId + 1, "next request queued");
+    }
+
+    /// @dev Build vaultData over `n` freshly-deployed mock stocks with equal weights (dust on the last),
+    ///      so the triggered-callback gas can be measured as a function of the leg count.
+    function _vaultDataNStocks(uint256 n) internal returns (bytes memory) {
+        address[] memory stocks = new address[](n);
+        uint24[] memory fees = new uint24[](n);
+        uint16[] memory w = new uint16[](n);
+        uint16 each = uint16(10_000 / n);
+        uint16 sum;
+        for (uint256 i = 0; i < n; i++) {
+            stocks[i] = address(new MockMintableERC20("S", "S", 18));
+            fees[i] = 500;
+            w[i] = i == n - 1 ? uint16(10_000 - sum) : each;
+            sum += each;
+        }
+        return _vaultDataFull(36, 100, 1e18, 1000, treasury, 0, abi.encode(stocks, fees, w));
+    }
+
+    /// @dev Gas probe (not an assertion of policy): the triggered callback's cost as the leg count grows.
+    ///      Combined with the fork test's real-router measurement, this is what bounds how many stock legs
+    ///      a single triggered distribute can carry under the Trigger Service's 2M cap.
+    function testTriggerCallbackGasByLegCount() public {
+        uint256[] memory counts = new uint256[](4);
+        counts[0] = 2;
+        counts[1] = 3;
+        counts[2] = 4;
+        counts[3] = 5;
+
+        for (uint256 k = 0; k < counts.length; k++) {
+            MockTriggerService ts = _installTriggerService();
+            ts.setMaxCallbackGas(30_000_000); // probe only — do not clip the measurement at the real cap
+            // Deploy the tax token + build the data BEFORE pranking: those deploys would consume the prank.
+            address tax = address(new MockTaxToken(100));
+            bytes memory data = _vaultDataNStocks(counts[k]);
+            vm.prank(PORTAL);
+            address vaultAddr = factory.newVault(tax, address(0), address(0xC0FFEE), data);
+            StockpileBasketVaultV2 v = StockpileBasketVaultV2(payable(vaultAddr));
+            _setupAndRegister(v);
+            vm.deal(address(v), 10 ether);
+
+            uint256 id = v.scheduleDistribute();
+            ts.fire(id);
+            emit log_named_uint(string.concat("mock callback gas, legs=", vm.toString(counts[k])), ts.lastCallbackGasUsed());
+        }
+    }
+
+    /// @dev Rule 008 §4: the callback must fit the service's hard 2,000,000 gas budget. `fire` runs it under
+    ///      exactly that cap, so this fails if the callback ever outgrows the budget.
+    function testTriggerCallbackWithinGasCap() public {
+        MockTriggerService ts = _installTriggerService();
+        StockpileBasketVaultV2 v = _newVault(address(new MockTaxToken(100)), 1000, 0);
+        _setupAndRegister(v);
+        vm.deal(address(v), 10 ether);
+
+        uint256 requestId = v.scheduleDistribute();
+        assertTrue(ts.fire(requestId), "callback fit the 2M budget");
+        assertLt(ts.lastCallbackGasUsed(), 2_000_000, "callback under the cap");
+        emit log_named_uint("trigger callback gas (3 legs, mock router)", ts.lastCallbackGasUsed());
+    }
+
+    /// @dev Rule 008 §1 — Critical if missing: only the chain-fixed service may invoke the callback.
+    function testTriggerRejectsNonService() public {
+        _installTriggerService();
+        StockpileBasketVaultV2 v = _newVault(address(new MockTaxToken(100)), 600, 0);
+        _setupAndRegister(v);
+        vm.deal(address(v), 1 ether);
+        uint256 requestId = v.scheduleDistribute();
+
+        vm.prank(makeAddr("rando"));
+        vm.expectRevert(bytes(unicode"Only trigger service / 仅限触发服务"));
+        v.trigger(requestId);
+    }
+
+    /// @dev Rule 008 §2 — replay protection: an unknown id, and a re-run of a consumed id, must both fail.
+    function testTriggerRejectsUnknownAndReplayedId() public {
+        MockTriggerService ts = _installTriggerService();
+        StockpileBasketVaultV2 v = _newVault(address(new MockTaxToken(100)), 600, 0);
+        _setupAndRegister(v);
+        vm.deal(address(v), 5 ether);
+        uint256 requestId = v.scheduleDistribute();
+
+        vm.prank(address(ts));
+        vm.expectRevert(bytes(unicode"Unknown request / 未知请求"));
+        v.trigger(requestId + 999); // never issued to this vault
+
+        ts.fire(requestId); // consumes it
+
+        vm.prank(address(ts));
+        vm.expectRevert(bytes(unicode"Unknown request / 未知请求"));
+        v.trigger(requestId); // replay of a consumed id
+    }
+
+    /// @dev Rule 008 §3 — delay-aware: `executeAfter` is a lower bound, so the callback re-checks the
+    ///      time-gate at execution time and distributes NOTHING rather than forcing the action.
+    function testTriggerSkipsWhenNotDue() public {
+        MockTriggerService ts = _installTriggerService();
+        StockpileBasketVaultV2 v = _newVault(address(new MockTaxToken(100)), 600, 1 hours);
+        _setupAndRegister(v);
+        vm.warp(block.timestamp + 1 hours);
+        vm.deal(address(v), 5 ether);
+
+        // First cycle distributes and re-arms.
+        uint256 id1 = v.scheduleDistribute();
+        ts.fire(id1);
+        uint256 spentAfterFirst = wbnb.balanceOf(treasury);
+
+        // The service fires the re-armed request early (it only guarantees a lower bound).
+        vm.deal(address(v), 5 ether);
+        uint256 id2 = v.pendingRequestId();
+        assertTrue(ts.fire(id2), "callback must not revert when not due");
+        assertEq(wbnb.balanceOf(treasury), spentAfterFirst, "nothing distributed while inside the interval");
+        assertEq(v.lastDistribute(), block.timestamp, "time-gate untouched by the skipped round");
+    }
+
+    /// @dev Only one request may be outstanding — otherwise repeated permissionless calls would drain the
+    ///      vault's BNB one service fee at a time.
+    function testScheduleIsOneAtATime() public {
+        _installTriggerService();
+        StockpileBasketVaultV2 v = _newVault(address(new MockTaxToken(100)), 600, 0);
+        _setupAndRegister(v);
+        vm.deal(address(v), 1 ether);
+
+        v.scheduleDistribute();
+        vm.expectRevert(bytes(unicode"Already scheduled / 已排程"));
+        v.scheduleDistribute();
+    }
+
+    function testScheduleRevertsWithoutFee() public {
+        _installTriggerService();
+        StockpileBasketVaultV2 v = _newVault(address(new MockTaxToken(100)), 600, 0);
+        _setupAndRegister(v);
+        // No BNB on the vault at all.
+        vm.expectRevert(bytes(unicode"Insufficient BNB for trigger fee / BNB不足以支付触发费"));
+        v.scheduleDistribute();
+    }
+
+    function testScheduleRevertsBeforeSetup() public {
+        _installTriggerService();
+        StockpileBasketVaultV2 v = _newVault(address(new MockTaxToken(100)), 600, 0);
+        vm.deal(address(v), 1 ether);
+        vm.expectRevert(bytes(unicode"Market not set up / 市场未建立"));
+        v.scheduleDistribute();
+    }
+
+    /// @dev If the vault cannot afford the re-arm, the callback must still succeed and leave the vault
+    ///      re-armable by anyone — the schedule may pause, but it must never become unrecoverable.
+    function testCallbackSurvivesFailedRearm() public {
+        MockTriggerService ts = _installTriggerService();
+        StockpileBasketVaultV2 v = _newVault(address(new MockTaxToken(100)), 1000, 0);
+        _setupAndRegister(v);
+        vm.deal(address(v), 1 ether);
+
+        uint256 id = v.scheduleDistribute();
+        ts.setFee(100 ether); // the vault can never afford the next request
+
+        assertTrue(ts.fire(id), "callback still succeeds");
+        assertFalse(v.triggerPending(), "no phantom outstanding request");
+
+        // Recoverable: lower the fee and anyone can re-arm.
+        ts.setFee(0.001 ether);
+        vm.deal(address(v), 1 ether);
+        vm.prank(makeAddr("anyone"));
+        v.scheduleDistribute();
+        assertTrue(v.triggerPending(), "re-armable by anyone");
+    }
+
+    function testClearPendingTriggerGuardianOnly() public {
+        _installTriggerService();
+        StockpileBasketVaultV2 v = _newVault(address(new MockTaxToken(100)), 600, 0);
+        _setupAndRegister(v);
+        vm.deal(address(v), 1 ether);
+        v.scheduleDistribute();
+
+        vm.prank(makeAddr("rando"));
+        vm.expectRevert(bytes(unicode"Only Guardian / 仅限 Guardian"));
+        v.clearPendingTrigger();
+
+        vm.prank(GUARDIAN);
+        v.clearPendingTrigger();
+        assertFalse(v.triggerPending(), "cleared");
+        assertEq(v.pendingRequestId(), 0, "id reset");
+    }
+
+    function testRearmOnlySelfReverts() public {
+        StockpileBasketVaultV2 v = _newVault(address(new MockTaxToken(100)), 600, 0);
+        vm.prank(makeAddr("rando"));
+        vm.expectRevert(bytes(unicode"Only self / 仅限自身"));
+        v.rearm();
+    }
+
     // ── commission = Flap Rule-001 formula for taxRate ∈ {50,100,300,1000} ───────
 
     function _commissionFor(uint16 taxRate, uint16 commissionBps) internal returns (uint256 commission) {
@@ -551,20 +849,28 @@ contract StockpileBasketVaultV2Test is Test {
     function testVaultUISchema() public {
         StockpileBasketVaultV2 v = _newVault(address(new MockTaxToken(100)), 600, 0);
         VaultUISchema memory schema = v.vaultUISchema();
-        assertEq(schema.methods.length, 5, "5 methods");
+        assertEq(schema.methods.length, 6, "4 reads + 2 writes");
         assertEq(schema.vaultType, "StockpileBasketVault", "vaultType");
 
-        // Only distribute (index 4) is a write method.
+        // Indices 0-3 are reads; 4 (scheduleDistribute) and 5 (distributeUniform) are writes.
         assertFalse(schema.methods[0].isWriteMethod, "pendingDistribute is read");
         assertFalse(schema.methods[1].isWriteMethod, "commissionBps is read");
         assertFalse(schema.methods[2].isWriteMethod, "basket is read");
         assertFalse(schema.methods[3].isWriteMethod, "gridId is read");
-        assertTrue(schema.methods[4].isWriteMethod, "distributeUniform is write");
-        assertEq(schema.methods[4].name, "distributeUniform", "5th is distributeUniform (L2 scalar minOut)");
-        assertEq(schema.methods[4].inputs.length, 2, "distributeUniform has minOutPerLeg + deadline");
+
+        // The permissionless Trigger Service entrypoint — the action a normal user actually needs.
+        assertTrue(schema.methods[4].isWriteMethod, "scheduleDistribute is write");
+        assertEq(schema.methods[4].name, "scheduleDistribute", "5th is scheduleDistribute");
+        assertEq(schema.methods[4].inputs.length, 0, "scheduleDistribute takes no inputs");
+
+        assertTrue(schema.methods[5].isWriteMethod, "distributeUniform is write");
+        assertEq(schema.methods[5].name, "distributeUniform", "6th is distributeUniform (L2 scalar minOut)");
+        assertEq(schema.methods[5].inputs.length, 2, "distributeUniform has minOutPerLeg + deadline");
         // Rule 001 (L2): the schema's write-method input must be scalar (uint256), not an array.
-        assertEq(schema.methods[4].inputs[0].name, "minOutPerLeg", "scalar uniform minOut");
-        assertEq(schema.methods[4].inputs[0].fieldType, "uint256", "minOut is scalar uint256");
+        assertEq(schema.methods[5].inputs[0].name, "minOutPerLeg", "scalar uniform minOut");
+        assertEq(schema.methods[5].inputs[0].fieldType, "uint256", "minOut is scalar uint256");
+        // Audit V-02: raw base units, so decimals must be 0 — a single value cannot scale heterogeneous legs.
+        assertEq(schema.methods[5].inputs[0].decimals, 0, "minOutPerLeg is raw base units");
     }
 
     // ── Immutable routing is correctly read through the proxy ───────────────────
@@ -884,5 +1190,13 @@ contract StockpileBasketVaultV2Test is Test {
         vm.prank(makeAddr("rando"));
         vm.expectRevert(bytes(unicode"Only Guardian / 仅限 Guardian"));
         v.setMinInterval(1 days);
+    }
+}
+
+/// @notice A destination that always rejects native BNB — used to prove the {receive} forward switch is
+///         failure-tolerant (Rule 005: the hook must never revert on a gas-limited send).
+contract RejectsBnb {
+    receive() external payable {
+        revert("no bnb");
     }
 }

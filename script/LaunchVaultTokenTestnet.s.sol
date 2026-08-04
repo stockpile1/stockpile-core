@@ -40,7 +40,7 @@ interface ITestnetUGM {
 ///         ── TWO-STEP ORDER (real broadcast) ────────────────────────────────────────────────────────────
 ///           1. Run DeployVaultFactory (broadcast) → note the logged factory + 7 mock stock addrs.
 ///           2. Export them and run this script:
-///                export FACTORY=0x…  STOCK0=0x… STOCK1=0x… STOCK2=0x… STOCK3=0x… STOCK4=0x… STOCK5=0x… STOCK6=0x…
+///                export FACTORY=0x…  STOCK0=0x… STOCK1=0x… STOCK2=0x… STOCK3=0x…
 ///           If FACTORY is unset, this script BOOTSTRAPS a throwaway factory + 7 mocks inline (so the DRY-RUN
 ///           can fully exercise the launch path) — do NOT broadcast the bootstrap path for a real launch.
 ///
@@ -70,7 +70,7 @@ contract LaunchVaultTokenTestnet is Script, VanityHelper {
 
     // Resolved deployment (from env, or bootstrapped for the dry-run).
     address internal factory;
-    address[7] internal stocks; // the 7-stock basket (SPCXB, QQQB, NVDAB, SPYB, TSLAB, AAPLB, XAUt)
+    address[4] internal stocks; // the 4-stock basket (SPCXB, NVDAB, AAPLB, SPYB) — see {StockConfig}
     bool internal bootstrapped;
 
     function run() external {
@@ -134,41 +134,35 @@ contract LaunchVaultTokenTestnet is Script, VanityHelper {
     function _resolveDeployment() internal {
         factory = vm.envOr("FACTORY", address(0));
         if (factory != address(0)) {
-            // The 7 basket stocks, in canonical order, from env (STOCK0..STOCK6).
+            // The 4 basket stocks, in canonical order, from env (STOCK0..STOCK3).
             stocks[0] = vm.envAddress("STOCK0");
             stocks[1] = vm.envAddress("STOCK1");
             stocks[2] = vm.envAddress("STOCK2");
             stocks[3] = vm.envAddress("STOCK3");
-            stocks[4] = vm.envAddress("STOCK4");
-            stocks[5] = vm.envAddress("STOCK5");
-            stocks[6] = vm.envAddress("STOCK6");
             return;
         }
-        // Bootstrap: no FACTORY env → deploy a throwaway factory + 7 mock stocks so the dry-run runs
-        // the full 7-stock launch path end-to-end.
+        // Bootstrap: no FACTORY env → deploy a throwaway factory + 4 mock stocks so the dry-run runs
+        // the full 4-stock launch path end-to-end.
         bootstrapped = true;
         MockV3Router router = new MockV3Router();
         MockMintableERC20 usdt = new MockMintableERC20("USDT-T", "USDT-T", 18);
         stocks[0] = address(new MockMintableERC20("SPCXB-T", "SPCXB-T", 18));
-        stocks[1] = address(new MockMintableERC20("QQQB-T", "QQQB-T", 18));
-        stocks[2] = address(new MockMintableERC20("NVDAB-T", "NVDAB-T", 18));
+        stocks[1] = address(new MockMintableERC20("NVDAB-T", "NVDAB-T", 18));
+        stocks[2] = address(new MockMintableERC20("AAPLB-T", "AAPLB-T", 18));
         stocks[3] = address(new MockMintableERC20("SPYB-T", "SPYB-T", 18));
-        stocks[4] = address(new MockMintableERC20("TSLAB-T", "TSLAB-T", 18));
-        stocks[5] = address(new MockMintableERC20("AAPLB-T", "AAPLB-T", 18));
-        stocks[6] = address(new MockMintableERC20("XAUt-T", "XAUt-T", 18));
         factory =
             address(new StockpileBasketVaultFactory(TWBNB, address(usdt), UGM, address(router), WBNB_USDT_FEE));
     }
 
-    // ── VaultDataV1: 7-stock basket (fees + weights from StockConfig; weights sum to 10_000) ────
+    // ── VaultDataV1: 4-stock basket (fees + weights from StockConfig; weights sum to 10_000) ────
 
     function _vaultData(address treasury) internal view returns (bytes memory) {
-        uint24[7] memory F = StockConfig.fees();
-        uint16[7] memory W = StockConfig.weights();
-        address[] memory st = new address[](7);
-        uint24[] memory fees = new uint24[](7);
-        uint16[] memory w = new uint16[](7);
-        for (uint256 i = 0; i < 7; i++) {
+        uint24[4] memory F = StockConfig.fees();
+        uint16[4] memory W = StockConfig.weights();
+        address[] memory st = new address[](4);
+        uint24[] memory fees = new uint24[](4);
+        uint16[] memory w = new uint16[](4);
+        for (uint256 i = 0; i < 4; i++) {
             st[i] = stocks[i];
             fees[i] = F[i];
             w[i] = W[i];

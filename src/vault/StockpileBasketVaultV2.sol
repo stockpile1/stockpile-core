@@ -3,6 +3,7 @@
 pragma solidity ^0.8.13;
 
 import {VaultBaseV2} from "./flap/VaultBaseV2.sol";
+import {IFlapTriggerService, ITriggerReceiver} from "./flap/IFlapTriggerService.sol";
 import {
     VaultUISchema,
     VaultMethodSchema,
@@ -117,7 +118,7 @@ interface IStockBasketDeployer {
 ///   guard + `try/catch`, never at init.
 ///
 ///   Per Rule 004 (UI-01) every revert is a literal **bilingual** `require` string — no custom errors.
-contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUpgradeable {
+contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUpgradeable, ITriggerReceiver {
     using SafeERC20 for IERC20;
 
     // ── Constants ────────────────────────────────────────────────────────────
@@ -138,6 +139,14 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
     ///         would gas-brick this vault's own `setupMarket` / `distribute` loops. Bounding it here keeps
     ///         both within a sane gas envelope (funds stay Guardian-recoverable regardless).
     uint256 public constant MAX_STOCKS = 20;
+    /// @notice Max stock legs a TRIGGERED distribute may carry. The Flap Trigger Service hard-caps every
+    ///         callback at 2,000,000 gas (Rule 008 §4) and a callback that exceeds it is recorded FAILED.
+    ///         Measured against live PancakeSwap V3 pools: ~690k fixed (wrap + commission + basket deposit +
+    ///         grid push + re-arm) plus ~225k per leg, so 5 legs lands near 1.8M and 6 exceeds the budget.
+    ///         Vaults with more legs than this must use the keeper path ({distribute} / {distributeUniform}),
+    ///         which has no such cap; {scheduleDistribute} rejects them up front rather than letting the
+    ///         service burn a fee on a callback that can never fit.
+    uint256 public constant MAX_TRIGGER_STOCKS = 5;
 
     // ── Routing immutables (set once in the constructor; shared by all proxies) ─
 
@@ -221,12 +230,31 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
     /// @notice True once {taxRateBps} has been successfully read from {taxToken} (a positive value).
     bool public taxRateKnown;
 
+    // ── Flap Trigger Service scheduling ──────────────────────────────────────
+
+    /// @notice Id of the outstanding {IFlapTriggerService} request, valid only while {triggerPending}.
+    uint256 public pendingRequestId;
+    /// @notice Whether a trigger request is currently outstanding. Kept as a separate flag rather than
+    ///         testing `pendingRequestId != 0`, because the service does not promise non-zero ids.
+    bool public triggerPending;
+
+    // ── Guardian rescue: incoming-BNB forward switch (SYS-REQ-RESCUE-MECHANISM) ─
+
+    /// @notice When true, native BNB arriving at {receive} is forwarded straight to {forwardAddress}
+    ///         instead of accruing. Defaults to FALSE — the vault only diverts revenue once the Guardian
+    ///         explicitly turns it on. Packed with {forwardAddress} into a single slot.
+    bool public autoForwardEnabled;
+    /// @notice Destination for forwarded BNB while {autoForwardEnabled}. Zero disables forwarding.
+    address public forwardAddress;
+
     // ── Upgrade storage gap (I2) ─────────────────────────────────────────────
 
     /// @dev Reserved storage so future beacon upgrades can append new state without shifting the layout of
     ///      any inheriting/adjacent slots. Sized to keep this contract's own declared storage on a round
     ///      50-slot budget; shrink `__gap` by exactly the number of slots any newly-added variables consume.
-    uint256[43] private __gap;
+    ///      Shrunk 43 -> 41 for {pendingRequestId} + {triggerPending}, then -> 40 for the packed
+    ///      {autoForwardEnabled} + {forwardAddress} slot.
+    uint256[40] private __gap;
 
     // ── Events ───────────────────────────────────────────────────────────────
 
@@ -248,6 +276,17 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
     event GridFeedFailed(bytes32 indexed assetHash, uint256 amount);
     /// @notice Emitted on {claimGridPayout}: creator-side grid revenue pulled from the UGM into the vault.
     event GridPayoutClaimed(address indexed token, uint256 amount);
+    /// @notice Emitted when a distribute is scheduled with the Flap Trigger Service.
+    event DistributeScheduled(uint256 indexed requestId, uint64 executeAfter, uint256 fee);
+    /// @notice Emitted when the Trigger Service callback runs a distribute.
+    event TriggerExecuted(uint256 indexed requestId, uint256 basketMinted);
+    /// @notice Emitted when the callback fires but conditions are not met, so it distributes nothing
+    ///         (Rule 008 §3 fail-safe: never force an action on stale conditions).
+    event TriggerSkipped(uint256 indexed requestId, string reason);
+    /// @notice Emitted when the Guardian clears a stuck outstanding request so scheduling can resume.
+    event PendingTriggerCleared(uint256 indexed requestId);
+    /// @notice Emitted when the Guardian arms or disarms the incoming-BNB forward switch.
+    event AutoForwardSet(bool enabled, address indexed forwardAddress);
     event KeeperSet(address indexed keeper, bool allowed);
     event CommissionSet(uint16 newBps);
     event TreasurySet(address indexed newTreasury);
@@ -418,10 +457,30 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
     // ── Native-BNB intake (THE fee path — Flap dispatches the fee as native BNB) ──
 
     /// @notice Accept the incoming fee. Flap dispatches the market portion to this vault as **native BNB**
-    ///         (a plain value transfer). This hook is a cheap no-op so it can NEVER revert on a gas-limited
-    ///         send (Rule 005): NO loops, NO external calls, NO delegatecall. The accrued BNB is wrapped to
-    ///         WBNB later, inside {distribute}.
-    receive() external payable {}
+    ///         (a plain value transfer). The accrued BNB is wrapped to WBNB later, inside {distribute}.
+    /// @dev    Normally a pure no-op, so it can NEVER revert on a gas-limited send (Rule 005): no loops,
+    ///         no delegatecall, and the ONE conditional external call below is bounded and failure-tolerant.
+    ///
+    ///         GUARDIAN FORWARD SWITCH (SYS-REQ-RESCUE-MECHANISM, facet b). {emergencyWithdrawNative} can
+    ///         only sweep BNB already held, so during an incident the Guardian would have to re-sweep every
+    ///         new inflow by hand — this vault is a Flap token's fee `marketAddress` and keeps receiving tax
+    ///         continuously. With {setAutoForward} armed, each inflow is redirected to {forwardAddress} on
+    ///         arrival and the hook returns early.
+    ///
+    ///         The forward is a low-level call with a bounded 60,000-gas stipend and its result is
+    ///         DELIBERATELY ignored: a reverting, gas-hungry or contract-typed destination must never make
+    ///         the fee transfer itself fail. If the forward does not succeed the BNB simply stays on the
+    ///         vault, exactly as before, and remains Guardian-recoverable. Worst case is a few thousand gas
+    ///         plus the stipend — three orders of magnitude below the Rule 005 budget of 1,000,000.
+    receive() external payable {
+        if (autoForwardEnabled) {
+            address to = forwardAddress;
+            if (to != address(0) && msg.value > 0) {
+                (bool ok,) = to.call{value: msg.value, gas: 60_000}("");
+                ok; // result intentionally unused — see above
+            }
+        }
+    }
 
     // ── Views ────────────────────────────────────────────────────────────────
 
@@ -753,6 +812,114 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
         emit GridPayoutClaimed(token, amount);
     }
 
+    // ── Flap Trigger Service scheduling (Rule 008) ────────────────────────────
+
+    /// @notice The Flap Trigger Service for the current chain (the decentralized scheduler that calls
+    ///         {trigger} back). Chain-fixed exactly like {VaultBase}'s portal/guardian resolution, so no
+    ///         privileged address can ever be repointed.
+    function triggerService() public view returns (address) {
+        uint256 chainId = block.chainid;
+        if (chainId == 56) return 0xcf4EE25035CF883895110f367F5BA8172416a7F9; // BNB mainnet
+        if (chainId == 97) return 0x560E9830926C9e0EB98a59c6b9902383Fc0D9Eb2; // BNB testnet
+        if (chainId == 4663) return 0xD3421B1b616a72bB88993A0cf75709BB8D532cc1; // Robinhood mainnet
+        if (chainId == 46630) return 0x34e7624e2c8F944Db1adD9a604fdB7C439CaEa1c; // Robinhood testnet
+        revert(unicode"Trigger service unavailable on this chain / 本链无触发服务");
+    }
+
+    /// @notice Schedule the next {distribute} with the Flap Trigger Service. PERMISSIONLESS — anyone may
+    ///         (re)arm the schedule, which is what removes the vault's dependency on a Guardian-appointed
+    ///         keeper ever showing up.
+    /// @dev    The service fee is paid in native BNB out of the vault's accrued balance, so it is funded by
+    ///         the fee stream itself. {getFee} is read LIVE at call time, never cached — the fee is dynamic
+    ///         on some chains. Only ONE request may be outstanding at a time, which bounds the fee spend to
+    ///         one fee per distribution cycle and makes repeated calls a no-op rather than a drain vector.
+    /// @return requestId The Trigger Service request id now outstanding.
+    function scheduleDistribute() external nonReentrant returns (uint256 requestId) {
+        return _schedule();
+    }
+
+    /// @dev Shared scheduling body. Private so {trigger} can re-arm from inside its own guarded frame.
+    function _schedule() private returns (uint256 requestId) {
+        require(basket != address(0), unicode"Market not set up / 市场未建立");
+        require(!triggerPending, unicode"Already scheduled / 已排程");
+        require(_stocks.length <= MAX_TRIGGER_STOCKS, unicode"Too many legs for trigger / 腿数超过触发上限");
+
+        address ts = triggerService();
+        uint256 fee = IFlapTriggerService(ts).getFee(); // LIVE read — never hardcode (dynamic fee)
+        require(address(this).balance >= fee, unicode"Insufficient BNB for trigger fee / BNB不足以支付触发费");
+
+        // `executeAfter` is a LOWER BOUND, not an appointment: ask for the moment the time-gate opens.
+        uint256 due = lastDistribute + minInterval;
+        uint64 executeAfter = due > block.timestamp ? uint64(due) : uint64(block.timestamp);
+
+        requestId = IFlapTriggerService(ts).requestTrigger{value: fee}(executeAfter);
+        pendingRequestId = requestId;
+        triggerPending = true;
+        emit DistributeScheduled(requestId, executeAfter, fee);
+    }
+
+    /// @notice Trigger Service callback: run a distribute, then re-arm the schedule.
+    /// @dev    Rule 008 compliance:
+    ///           §1 sender — only the chain-fixed {triggerService} may call (anything else reverts).
+    ///           §2 replay — the id must match the ONE outstanding request, and it is consumed BEFORE any
+    ///              effect, so a replayed or unknown id cannot re-enter the body.
+    ///           §3 delay-aware — `executeAfter` is a lower bound, so the time-gate and the pending balance
+    ///              are RE-CHECKED here. If either is unmet the callback distributes nothing and emits
+    ///              {TriggerSkipped} instead of forcing the action; it still re-arms so the loop survives.
+    ///           §5 reentrancy — `nonReentrant`, and every external call on the path is already isolated.
+    ///
+    ///         SLIPPAGE: the callback carries no parameters, so the swaps run with a ZERO floor. This is a
+    ///         deliberate, documented decision (audit H-03): the Trigger Service submits through a private
+    ///         node RPC, so the execution transaction is not exposed to the public mempool. The residual
+    ///         risk — a pool priced badly at execution time for any reason — is accepted, in exchange for
+    ///         the vault needing no off-chain keeper and no on-chain price oracle.
+    ///
+    ///         RE-ARM ORDERING: the next request is paid for FIRST, because {_distribute} wraps the vault's
+    ///         entire native balance into WBNB and would otherwise leave nothing for the fee.
+    /// @param  requestId The request being executed.
+    function trigger(uint256 requestId) external override nonReentrant {
+        require(msg.sender == triggerService(), unicode"Only trigger service / 仅限触发服务");
+        require(triggerPending && requestId == pendingRequestId, unicode"Unknown request / 未知请求");
+
+        // Consume the request before anything else (replay protection).
+        triggerPending = false;
+        pendingRequestId = 0;
+
+        // Re-arm before the swaps so the fee comes out of native BNB while it is still unwrapped.
+        // Best-effort: a fee shortfall must leave the vault re-armable by anyone, not fail the callback.
+        try this.rearm() {} catch { /* re-arm later via the permissionless scheduleDistribute() */ }
+
+        // Re-validate at execution time (§3) rather than trusting the schedule.
+        if (block.timestamp < lastDistribute + minInterval) {
+            emit TriggerSkipped(requestId, "too soon");
+            return;
+        }
+        if (IERC20(wbnb).balanceOf(address(this)) + address(this).balance == 0) {
+            emit TriggerSkipped(requestId, "nothing to distribute");
+            return;
+        }
+
+        uint256 minted = _distribute(new uint256[](_stocks.length), block.timestamp);
+        emit TriggerExecuted(requestId, minted);
+    }
+
+    /// @notice Self-gated re-arm helper so {trigger} can isolate a failing schedule in a try/catch.
+    /// @dev    Callable ONLY by this contract, exactly like {swapLeg} / {approveStock}.
+    function rearm() external {
+        require(msg.sender == address(this), unicode"Only self / 仅限自身");
+        _schedule();
+    }
+
+    /// @notice Guardian escape hatch: clear a stuck outstanding request so {scheduleDistribute} works again.
+    /// @dev    Needed because a request that can never execute (nor be retried via the service's
+    ///         `retryTrigger`) would otherwise pin {triggerPending} true forever and block all rescheduling.
+    function clearPendingTrigger() external onlyGuardian {
+        uint256 id = pendingRequestId;
+        triggerPending = false;
+        pendingRequestId = 0;
+        emit PendingTriggerCleared(id);
+    }
+
     // ── Grid adapter binding (permissionless) ─────────────────────────────────
 
     /// @notice Bind this vault as the UGM adapter for its grid so {distribute} can deliver its basket shares.
@@ -808,6 +975,19 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
         }
     }
 
+    /// @notice Arm or disarm the incoming-BNB forward switch on {receive} (SYS-REQ-RESCUE-MECHANISM).
+    /// @dev    Guardian-only and OFF by default, so revenue is never diverted without an explicit act.
+    ///         Together with {emergencyWithdrawNative} — which recovers what is already held — this covers
+    ///         both halves of the rescue mechanism: sweep the past, redirect the future.
+    /// @param  enabled Whether arriving BNB should be forwarded on receipt.
+    /// @param  to      Destination for forwarded BNB; must be non-zero when `enabled`.
+    function setAutoForward(bool enabled, address to) external onlyGuardian {
+        require(!enabled || to != address(0), unicode"Zero address / 零地址");
+        autoForwardEnabled = enabled;
+        forwardAddress = to;
+        emit AutoForwardSet(enabled, to);
+    }
+
     /// @notice Guardian escape hatch to recover native BNB. Drains the FULL balance to `to`.
     function emergencyWithdrawNative(address to) external onlyGuardian nonReentrant {
         require(to != address(0), unicode"Zero address / 零地址");
@@ -821,95 +1001,120 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
 
     // ── Metadata / UI schema ──────────────────────────────────────────────────
 
-    /// @notice Legacy status string. The UI relies on {vaultUISchema} for rendering.
+    /// @notice Legacy status string. Rule 001 deprecates this field — the UI renders from {vaultUISchema} —
+    ///         so it is kept deliberately terse to conserve runtime size (this impl is near the EIP-170 cap).
     function description() public view override returns (string memory) {
-        if (basket == address(0)) {
-            return unicode"StockpileBasketVault: awaiting setupMarket() to deploy its basket + grid."
-                unicode" / StockpileBasketVault：等待 setupMarket() 部署其篮子和网格。";
-        }
-        return unicode"StockpileBasketVault: routes a Flap token's BNB tax into a stock basket, then into a Stockpile grid. Call distribute() to swap + forward."
-            unicode" / StockpileBasketVault：将 Flap 代币的 BNB 税收路由到股票篮子，再进入 Stockpile 网格。调用 distribute() 兑换并转发。";
+        return basket == address(0)
+            ? unicode"StockpileBasketVault: awaiting setupMarket(). / 等待 setupMarket()。"
+            : unicode"StockpileBasketVault: active. / 已启用。";
     }
 
     /// @notice On-chain UI schema describing this vault's runtime actions.
-    /// @dev    Four reads + the single keeper write:
+    /// @dev    Four reads + two writes:
     ///           • pendingDistribute (read)  — BNB/WBNB accrued, awaiting distribute.
     ///           • commissionBps     (read)  — commission cap skimmed to the treasury (bps).
     ///           • basket            (read)  — the vault's StockBasket index token.
     ///           • gridId            (read)  — the vault's UGM grid id.
-    ///           • distributeUniform (write) — swap + deposit + forward, scalar (uniform) slippage floor.
-    ///                                         No ApproveAction (vault custodies). Rule 001 (L2): the schema
-    ///                                         vocabulary is scalar-only, so the array-input {distribute} is
-    ///                                         NOT surfaced here — bespoke keepers call it directly.
+    ///           • scheduleDistribute(write) — PERMISSIONLESS: arm the Flap Trigger Service.
+    ///           • distributeUniform (write) — keeper path, scalar (uniform) slippage floor.
+    ///         No ApproveAction anywhere (the vault custodies its own funds). Rule 001 (L2): the schema
+    ///         vocabulary is scalar-only, so the array-input {distribute} is NOT surfaced — bespoke keeper
+    ///         tooling calls it directly.
+    ///
+    ///         Descriptions are kept SHORT on purpose: this function's string literals dominate the
+    ///         contract's runtime size, and the impl sits close to the EIP-170 limit.
     function vaultUISchema() public pure override returns (VaultUISchema memory schema) {
         schema.vaultType = "StockpileBasketVault";
         schema.description =
-            unicode"Per-token vault that routes a Flap token's native-BNB tax into a basket of stock tokens, then "
-            unicode"into a Stockpile Harberger grid. BNB accrues on the vault; a keeper calls distribute() to skim "
-            unicode"the commission, swap the rest into the stocks, mint basket shares, and forward them to the grid "
-            unicode"where seat holders earn them."
-            unicode" / 每代币金库，将 Flap 代币的原生 BNB 税收路由到一篮子股票代币，再进入 Stockpile Harberger 网格。BNB "
-            unicode"在金库累积；keeper 调用 distribute() 抽取佣金、将其余兑换为股票、铸造篮子份额并转发到网格，供席位持有者赚取。";
+            unicode"Routes a Flap token's BNB tax into a stock basket, then a Stockpile grid."
+            unicode" / 将 Flap 代币的 BNB 税收路由到股票篮子，再进入 Stockpile 网格。";
 
-        schema.methods = new VaultMethodSchema[](5);
+        schema.methods = new VaultMethodSchema[](6);
 
-        // Read: pendingDistribute() — the actionable live number driving distribute().
-        schema.methods[0].name = "pendingDistribute";
-        schema.methods[0].description =
-            unicode"BNB/WBNB currently accrued on the vault, awaiting distribute() into the basket + grid."
-            unicode" / 当前在金库累积、等待通过 distribute() 进入篮子和网格的 BNB/WBNB。";
-        schema.methods[0].inputs = new FieldDescriptor[](0);
-        schema.methods[0].outputs = new FieldDescriptor[](1);
-        schema.methods[0].outputs[0] =
-            FieldDescriptor("pending", "uint256", unicode"Pending BNB/WBNB awaiting distribute() / 等待 distribute() 的待处理 BNB/WBNB", 18);
-        schema.methods[0].approvals = new ApproveAction[](0);
+        // Reads — all share the "no inputs, one scalar output" shape, so they go through {_readMethod}.
+        schema.methods[0] = _readMethod(
+            "pendingDistribute",
+            unicode"BNB/WBNB accrued, awaiting distribute(). / 已累积、等待 distribute() 的 BNB/WBNB。",
+            "pending",
+            "uint256",
+            unicode"Pending BNB/WBNB / 待处理 BNB/WBNB",
+            18
+        );
+        schema.methods[1] = _readMethod(
+            "commissionBps",
+            unicode"Commission cap per distribute(), in bps (100 = 1%). / 每次 distribute() 的佣金上限（基点，100 = 1%）。",
+            "commissionBps",
+            "uint16",
+            unicode"Commission cap (bps) / 佣金上限（基点）",
+            0
+        );
+        schema.methods[2] = _readMethod(
+            "basket",
+            unicode"The StockBasket index token. / StockBasket 指数代币。",
+            "basket",
+            "address",
+            unicode"StockBasket address / StockBasket 地址",
+            0
+        );
+        schema.methods[3] = _readMethod(
+            "gridId",
+            unicode"The UGM grid this vault feeds. / 本金库供给的 UGM 网格。",
+            "gridId",
+            "uint256",
+            unicode"Grid id / 网格 id",
+            0
+        );
 
-        // Read: commissionBps() — the commission cap skimmed to the treasury.
-        schema.methods[1].name = "commissionBps";
-        schema.methods[1].description =
-            unicode"Commission cap skimmed from each distribute() to the treasury, in basis points (100 = 1%)."
-            unicode" / 每次 distribute() 抽取给国库的佣金上限，以基点计（100 = 1%）。";
-        schema.methods[1].inputs = new FieldDescriptor[](0);
-        schema.methods[1].outputs = new FieldDescriptor[](1);
-        schema.methods[1].outputs[0] =
-            FieldDescriptor("commissionBps", "uint16", unicode"Commission cap in basis points / 佣金上限（基点）", 0);
-        schema.methods[1].approvals = new ApproveAction[](0);
-
-        // Read: basket() — the vault's StockBasket index token.
-        schema.methods[2].name = "basket";
-        schema.methods[2].description =
-            unicode"The vault's StockBasket index token — the grid's single yield token; redeems for a pro-rata slice of every stock."
-            unicode" / 金库的 StockBasket 指数代币 —— 网格的唯一收益代币；可按比例赎回每种股票。";
-        schema.methods[2].inputs = new FieldDescriptor[](0);
-        schema.methods[2].outputs = new FieldDescriptor[](1);
-        schema.methods[2].outputs[0] =
-            FieldDescriptor("basket", "address", unicode"StockBasket token address / StockBasket 代币地址", 0);
-        schema.methods[2].approvals = new ApproveAction[](0);
-
-        // Read: gridId() — the vault's UGM grid id.
-        schema.methods[3].name = "gridId";
-        schema.methods[3].description =
-            unicode"The UGM grid id this vault feeds; seat holders of this grid earn the basket shares."
-            unicode" / 本金库供给的 UGM 网格 id；该网格的席位持有者赚取篮子份额。";
-        schema.methods[3].inputs = new FieldDescriptor[](0);
-        schema.methods[3].outputs = new FieldDescriptor[](1);
-        schema.methods[3].outputs[0] =
-            FieldDescriptor("gridId", "uint256", unicode"UGM grid id / UGM 网格 id", 0);
-        schema.methods[3].approvals = new ApproveAction[](0);
-
-        // Write: distributeUniform(uint256 minOutPerLeg, uint256 deadline) — keeper/guardian gated; no
-        // approvals. Scalar minOut (Rule 001, L2): the array-input distribute() is not schema-expressible.
-        schema.methods[4].name = "distributeUniform";
-        schema.methods[4].description =
-            unicode"Wrap accrued BNB, swap the net into the basket's stocks, mint basket shares, forward them into the grid, and skim the commission proportional to what distributed. Applies ONE uniform slippage floor to every stock leg. Keeper- or Guardian-gated and time-gated."
-            unicode" / 包装累积的 BNB、将净额兑换为篮子股票、铸造篮子份额并转发到网格，并按实际分配比例抽取佣金。对每个股票腿应用同一个滑点下限。仅限 keeper 或 Guardian 调用，并有时间间隔限制。";
-        schema.methods[4].inputs = new FieldDescriptor[](2);
-        schema.methods[4].inputs[0] =
-            FieldDescriptor("minOutPerLeg", "uint256", unicode"Uniform minimum output amount applied to every stock leg (slippage floor) / 应用于每个股票腿的统一最小输出数量（滑点下限）", 18);
-        schema.methods[4].inputs[1] =
-            FieldDescriptor("deadline", "time", unicode"Unix timestamp after which the swaps revert / 兑换在此 Unix 时间戳后回退", 0);
-        schema.methods[4].outputs = new FieldDescriptor[](0);
-        schema.methods[4].approvals = new ApproveAction[](0);
+        // Write: scheduleDistribute() — PERMISSIONLESS. The primary user-facing action: it arms the Flap
+        // Trigger Service, which then calls back and distributes without any keeper being appointed.
+        schema.methods[4] = _readMethod(
+            "scheduleDistribute",
+            unicode"Anyone may call: schedule the next distribute via the Flap Trigger Service."
+            unicode" / 任何人可调用：通过 Flap 触发服务排程下一次 distribute。",
+            "requestId",
+            "uint256",
+            unicode"Request id / 请求 id",
+            0
+        );
         schema.methods[4].isWriteMethod = true;
+
+        // Write: distributeUniform(uint256 minOutPerLeg, uint256 deadline) — keeper/guardian gated.
+        schema.methods[5].name = "distributeUniform";
+        schema.methods[5].description =
+            unicode"Keeper path: swap, mint basket shares, feed the grid, skim commission. One floor per leg."
+            unicode" / Keeper 路径：兑换、铸造份额、供给网格、抽取佣金。每腿一个下限。";
+        schema.methods[5].inputs = new FieldDescriptor[](2);
+        // `decimals` is 0, not 18 (audit V-02): the floor applies to every leg, and the stocks are
+        // launcher-chosen tokens whose decimals may differ, so the value is passed as RAW base units.
+        schema.methods[5].inputs[0] = FieldDescriptor(
+            "minOutPerLeg",
+            "uint256",
+            unicode"Min output per leg, raw base units / 每腿最小输出（原始单位）",
+            0
+        );
+        schema.methods[5].inputs[1] =
+            FieldDescriptor("deadline", "time", unicode"Swaps revert after this time / 兑换在此时间后回退", 0);
+        schema.methods[5].outputs = new FieldDescriptor[](0);
+        schema.methods[5].approvals = new ApproveAction[](0);
+        schema.methods[5].isWriteMethod = true;
+    }
+
+    /// @dev Build a schema entry with no inputs and exactly one scalar output. Factored out because the
+    ///      repeated per-method allocation code — not the strings — dominates {vaultUISchema}'s bytecode,
+    ///      and this impl sits close to the EIP-170 runtime limit.
+    function _readMethod(
+        string memory name_,
+        string memory desc,
+        string memory outName,
+        string memory outType,
+        string memory outDesc,
+        uint8 dec
+    ) private pure returns (VaultMethodSchema memory m) {
+        m.name = name_;
+        m.description = desc;
+        m.inputs = new FieldDescriptor[](0);
+        m.outputs = new FieldDescriptor[](1);
+        m.outputs[0] = FieldDescriptor(outName, outType, outDesc, dec);
+        m.approvals = new ApproveAction[](0);
     }
 }

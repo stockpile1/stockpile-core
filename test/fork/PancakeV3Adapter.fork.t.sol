@@ -103,6 +103,12 @@ contract PancakeV3AdapterForkTest is ForkBase {
         uint256 gridId = _createWbnbGrid();
         bytes32 assetHash = adapter.registerPosition(gridId, tokenId, BscAddresses.WBNB, FEE);
 
+        // One position per yield token (mirrors FlapYieldAdapter). `_harvest` sweeps the adapter's WHOLE
+        // balance of the yield token, so a second position claiming WBNB could carry off this position's
+        // residual — registering it must be rejected outright.
+        vm.expectRevert(bytes("yieldToken in use"));
+        adapter.registerPosition(gridId, tokenId, BscAddresses.WBNB, FEE);
+
         // pendingYield reads the position's tokensOwed best-effort without reverting.
         adapter.pendingYield(assetHash);
 
