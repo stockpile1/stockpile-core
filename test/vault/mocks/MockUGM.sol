@@ -115,15 +115,18 @@ contract MockUGM {
         payoutOf[token] += amount;
     }
 
-    /// @notice Faithful-enough mirror of `UnifiedGridManager.claimPayout`: pay the CALLER its
-    ///         entire accrued payout in `token` and return the amount. The factory is the grid
-    ///         creator, so this is how it pulls creator-side revenue to itself.
+    /// @notice Faithful mirror of `UnifiedGridManager.claimPayout`: pay the CALLER its entire accrued
+    ///         payout in `token` and return the amount. The vault is its own grid's creator, so this is
+    ///         how it pulls creator-side revenue (seat sales, tax share) to itself — see
+    ///         `StockpileBasketVaultV2.claimGridPayout`.
+    /// @dev    REVERTS on a zero balance with the real UGM's exact `"nothing"` string (see
+    ///         `UnifiedGridManager.claimPayout`). The mock previously returned 0 silently, which would
+    ///         have hidden the fact that callers must tolerate that revert.
     function claimPayout(address token) external returns (uint256 amount) {
         amount = payoutOf[token];
-        if (amount != 0) {
-            payoutOf[token] = 0;
-            IERC20(token).transfer(msg.sender, amount);
-        }
+        require(amount > 0, "nothing");
+        payoutOf[token] = 0;
+        IERC20(token).transfer(msg.sender, amount);
     }
 
     /// @notice Mirror of `UnifiedGridManager.claimYieldBatch`: in the real UGM this settles

@@ -44,6 +44,11 @@ interface IUGM {
     function registerAsset(uint256 gridId, bytes32 assetHash) external;
     /// @notice Forward `amount` of `token` (the grid's yieldToken) to seat holders of `assetHash`'s grid.
     function receiveYieldERC20(bytes32 assetHash, address token, uint256 amount) external;
+    /// @notice Withdraw the CALLER's accrued pull-based payouts in `token`. The vault is its own grid's
+    ///         `creator`, so seat-sale proceeds, the creator share of settled Harberger tax and yield on
+    ///         unsold/vacant seats all accrue to the vault here and MUST be pulled — see {claimGridPayout}.
+    ///         Reverts ("nothing") when the balance is zero, so callers must tolerate that.
+    function claimPayout(address token) external returns (uint256 amount);
 }
 
 /// @notice PancakeSwap V3 SwapRouter on BSC (0x1b81D678…). Uses the classic Uniswap V3
@@ -235,6 +240,14 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
     event Distributed(
         address indexed caller, uint256 gross, uint256 commission, uint256 net, uint256 spentWBNB, uint256 basketMinted
     );
+    /// @notice Emitted when a stock leg is skipped mid-{distribute} (dead pool, unreachable slippage floor,
+    ///         or a stock that refuses the basket approval). Makes best-effort degradation OBSERVABLE:
+    ///         without it an under-spent round is indistinguishable from a healthy one (AUDIT L-02).
+    event LegSkipped(uint256 indexed legIndex, address indexed stock, uint256 amountIn, string phase);
+    /// @notice Emitted when the grid push is skipped (grid not yet registered / paused / hijacked).
+    event GridFeedFailed(bytes32 indexed assetHash, uint256 amount);
+    /// @notice Emitted on {claimGridPayout}: creator-side grid revenue pulled from the UGM into the vault.
+    event GridPayoutClaimed(address indexed token, uint256 amount);
     event KeeperSet(address indexed keeper, bool allowed);
     event CommissionSet(uint16 newBps);
     event TreasurySet(address indexed newTreasury);
@@ -517,18 +530,22 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
         uint256 grossCommission = _commission(gross);
         uint256 net = gross - grossCommission;
 
-        // ── Effects: advance the time-gate BEFORE any external interaction (CEI). ──
-        lastDistribute = block.timestamp;
-
-        // SWAP PHASE → per-stock bought amounts + total WBNB actually swapped (spentWBNB <= net).
-        (uint256[] memory amounts, uint256 spentWBNB) = _swapAll(net, minOut, deadline);
+        // SWAP PHASE → per-stock bought amounts, per-leg WBNB spend, and the total actually swapped.
+        (uint256[] memory amounts, uint256[] memory legSpend, uint256 spentWBNB) = _swapAll(net, minOut, deadline);
 
         if (spentWBNB == 0) {
             // Dead-pool / all-slippage round: nothing bought. Leave net WBNB for next time and take NO
-            // commission — the retained WBNB stays UNTAXED until it is actually distributed (L1).
+            // commission — the retained WBNB stays UNTAXED until it is actually distributed (L1). The
+            // time-gate is deliberately NOT advanced (AUDIT M-01): a round that distributed nothing must not
+            // burn the `minInterval` window, or one bad `minOut`/`deadline` would DoS distribute for up to
+            // {MAX_MIN_INTERVAL}. Re-entry is already impossible — both callers hold `nonReentrant`.
             emit Distributed(msg.sender, gross, 0, net, 0, 0);
             return 0;
         }
+
+        // ── Effects: advance the time-gate now that the round is productive. Safe to sequence after the
+        //    swaps because {distribute} / {distributeUniform} both wrap this body in `nonReentrant`. ──
+        lastDistribute = block.timestamp;
 
         // Commission proportional to the WBNB actually distributed this round (net > 0 here, since
         // spentWBNB > 0). When every leg succeeds, spentWBNB == net and commission == grossCommission. The
@@ -536,8 +553,8 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
         uint256 commission = (grossCommission * spentWBNB) / net;
         if (commission > 0) IERC20(_wbnb).safeTransfer(treasury, commission);
 
-        // BASKET PHASE: deposit the bought stocks, mint `spentWBNB` shares to the vault.
-        basketMinted = _depositToBasket(amounts, spentWBNB);
+        // BASKET PHASE: deposit the bought stocks; shares minted == the value of the legs that LAND (H-02).
+        basketMinted = _depositToBasket(amounts, legSpend);
 
         // GRID PHASE: forward the minted shares (plus any backlog from a prior failed feed) into the grid.
         _feedGrid();
@@ -573,12 +590,15 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
 
     /// @dev Split `net` WBNB across the stock legs (dust on the last leg) and swap each slice best-effort
     ///      via {swapLeg}. Approves the router once for the whole `net`, resets to 0 after.
+    ///      Also returns the per-leg WBNB spend so {_depositToBasket} can size the basket mint to the value
+    ///      that actually reaches the basket rather than to the whole round (AUDIT H-02).
     function _swapAll(uint256 net, uint256[] memory minOut, uint256 deadline)
         private
-        returns (uint256[] memory amounts, uint256 spentWBNB)
+        returns (uint256[] memory amounts, uint256[] memory legSpend, uint256 spentWBNB)
     {
         uint256 n = _stocks.length;
         amounts = new uint256[](n);
+        legSpend = new uint256[](n);
 
         IERC20(wbnb).forceApprove(swapRouter, net);
 
@@ -597,9 +617,11 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
             // revert ONLY that leg. The catch skips it (amounts[i] stays 0) and its WBNB is retained.
             try this.swapLeg(i, amountIn, minOut[i], deadline) returns (uint256 out) {
                 amounts[i] = out;
+                legSpend[i] = amountIn;
                 spentWBNB += amountIn;
             } catch {
                 /* leg failed (dead pool / slippage): skip; its WBNB stays for next distribute */
+                emit LegSkipped(i, _stocks[i].stock, amountIn, "swap");
             }
         }
 
@@ -631,22 +653,52 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
         require(out > 0, unicode"Zero swap output / 兑换输出为零");
     }
 
-    /// @dev Deposit the bought stocks into the basket, minting `spentWBNB` shares to the vault. Approves
-    ///      the basket per non-zero leg, deposits (pulls exactly `amounts[i]` in the basket's stock order),
-    ///      then resets those approvals to 0.
-    function _depositToBasket(uint256[] memory amounts, uint256 spentWBNB) private returns (uint256 minted) {
+    /// @dev Deposit the bought stocks into the basket, minting shares sized to the value of the legs that
+    ///      actually land (`legSpend[i]` per successful pull — AUDIT H-02).
+    ///
+    ///      DEPOSITS BALANCES, NOT THIS ROUND'S DELTAS (AUDIT L-03): each leg contributes its FULL vault
+    ///      balance, so stock left behind by a previously-skipped pull is swept in on the next round
+    ///      instead of being stranded until a Guardian rescue. Such residue arrives with `legSpend[i]`
+    ///      covering only the current round, so it enters the basket unminted — it accrues to every holder
+    ///      rather than being lost, mirroring how {_feedGrid} already sweeps a backlog of basket shares.
+    ///
+    ///      APPROVALS ARE ISOLATED (AUDIT M-05): a stock that permits `transfer` but reverts `approve`
+    ///      (compliance tokens gating approvals by spender/owner) would otherwise revert the WHOLE
+    ///      distribute here — after the swaps — and brick every subsequent round identically, defeating the
+    ///      best-effort design that every other leg interaction on this path follows.
+    function _depositToBasket(uint256[] memory amounts, uint256[] memory legSpend) private returns (uint256 minted) {
         address _basket = basket;
-        uint256 n = amounts.length;
+        uint256 n = _stocks.length;
+        address[] memory stx = new address[](n);
 
         for (uint256 i = 0; i < n; i++) {
-            if (amounts[i] > 0) IERC20(_stocks[i].stock).forceApprove(_basket, amounts[i]);
+            stx[i] = _stocks[i].stock;
+            amounts[i] = IERC20(stx[i]).balanceOf(address(this)); // L-03: sweep this round's buy + any residue
+            if (amounts[i] == 0) continue;
+            try this.approveStock(stx[i], _basket, amounts[i]) {}
+            catch {
+                // Un-approvable stock: drop the leg entirely so the basket neither pulls it nor credits it.
+                emit LegSkipped(i, stx[i], legSpend[i], "approve");
+                amounts[i] = 0;
+                legSpend[i] = 0;
+            }
         }
 
-        minted = StockBasket(_basket).deposit(amounts, spentWBNB, address(this));
+        minted = StockBasket(_basket).deposit(amounts, legSpend, address(this));
 
         for (uint256 i = 0; i < n; i++) {
-            if (amounts[i] > 0) IERC20(_stocks[i].stock).forceApprove(_basket, 0);
+            if (amounts[i] > 0) {
+                try this.approveStock(stx[i], _basket, 0) {} catch { /* dangling allowance to our own basket */ }
+            }
         }
+    }
+
+    /// @notice Self-gated approval helper for {_depositToBasket}'s isolated per-leg approvals (M-05).
+    /// @dev    Callable ONLY by this contract, exactly like {swapLeg}; the self-gate makes it a no-op
+    ///         attack surface for anyone else.
+    function approveStock(address token, address spender, uint256 amount) external {
+        require(msg.sender == address(this), unicode"Only self / 仅限自身");
+        IERC20(token).forceApprove(spender, amount);
     }
 
     /// @dev Forward the vault's ENTIRE basket balance into the vault's single grid, BEST-EFFORT (I1): the
@@ -664,8 +716,41 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
         try IUGM(_ugm).receiveYieldERC20(assetHash, _basket, bal) {}
         catch {
             /* grid not yet registered / paused: shares stay as basket on the vault (recoverable) */
+            emit GridFeedFailed(assetHash, bal);
         }
         IERC20(_basket).forceApprove(_ugm, 0);
+    }
+
+    // ── Grid creator revenue (permissionless) ─────────────────────────────────
+
+    /// @notice Pull this vault's accrued creator-side grid revenue out of the UGM and into the vault.
+    /// @dev    PERMISSIONLESS and idempotent. {setupMarket} calls `createGrid` from this vault, so the UGM
+    ///         records the VAULT as the grid's `creator` and credits it — pull-based — with the creator
+    ///         share of primary seat sales, of buyout fees, of Dutch-auction clearing, of every settled
+    ///         Harberger tax payment, and with yield accrued on unsold / vacant seats. All of it is
+    ///         withdrawable ONLY by the creator calling `claimPayout`, so without this function every last
+    ///         unit of it was stranded in the UGM forever (AUDIT H-01) — `emergencyWithdrawToken` could not
+    ///         reach it either, since it moves only tokens the vault already holds.
+    ///
+    ///         The UGM reverts ("nothing") on a zero balance, so the call is wrapped: a no-op claim returns
+    ///         0 instead of reverting, keeping this safe to call speculatively from a keeper or a UI.
+    ///
+    ///         DESTINATION: claimed WBNB simply lands on the vault and is picked up as `gross` by the next
+    ///         {distribute} — it flows onward to seat holders exactly like a fresh fee receipt. Claiming the
+    ///         {basket} token is permitted too: those shares are re-forwarded to the grid by the next
+    ///         {distribute}'s {_feedGrid}, which redistributes them across the grid's seats. Each such cycle
+    ///         moves the unsold-seat portion closer to sold seats, so it converges rather than looping.
+    /// @param  token The payout token to withdraw (typically the grid's `taxToken`, i.e. WBNB).
+    /// @return amount The amount pulled in (0 if the UGM had nothing credited).
+    function claimGridPayout(address token) external nonReentrant returns (uint256 amount) {
+        require(basket != address(0), unicode"Market not set up / 市场未建立");
+        require(token != address(0), unicode"Zero address / 零地址");
+        try IUGM(ugm).claimPayout(token) returns (uint256 a) {
+            amount = a;
+        } catch {
+            /* nothing credited yet: report 0 rather than reverting */
+        }
+        emit GridPayoutClaimed(token, amount);
     }
 
     // ── Grid adapter binding (permissionless) ─────────────────────────────────

@@ -149,7 +149,34 @@ contract StockBasketTest is Test {
         amts[1] = a1;
         amts[2] = a2;
         amts[3] = a3;
-        return basket.deposit(amts, shares, to);
+        return basket.deposit(amts, _legValues(amts, shares), to);
+    }
+
+    /// @dev Build the per-leg value array {StockBasket.deposit} now takes (AUDIT H-02): spread `total`
+    ///      evenly across the legs with a non-zero `amts` entry, remainder on the last such leg. A deposit
+    ///      where every leg lands therefore mints exactly `total`, and a SKIPPED leg subtracts exactly its
+    ///      own share of it — which is the whole point of the fix.
+    function _legValues(uint256[] memory amts, uint256 total) internal pure returns (uint256[] memory lv) {
+        lv = new uint256[](amts.length);
+        uint256 count;
+        for (uint256 i = 0; i < amts.length; i++) {
+            if (amts[i] > 0) count++;
+        }
+        if (count == 0) return lv;
+
+        uint256 per = total / count;
+        uint256 assigned;
+        uint256 seen;
+        for (uint256 i = 0; i < amts.length; i++) {
+            if (amts[i] == 0) continue;
+            seen++;
+            if (seen == count) {
+                lv[i] = total - assigned; // last non-zero leg absorbs the rounding dust
+            } else {
+                lv[i] = per;
+                assigned += per;
+            }
+        }
     }
 
     // ── 1. First deposit ───────────────────────────────────────────────────────
@@ -269,10 +296,10 @@ contract StockBasketTest is Test {
         uint256[] memory amts = new uint256[](2);
         amts[0] = 777e18;
         amts[1] = 333e18;
-        b2.deposit(amts, 500e18, ALICE);
+        b2.deposit(amts, _legValues(amts, 500e18), ALICE);
         amts[0] = 111e18;
         amts[1] = 222e18;
-        b2.deposit(amts, 500e18, BOB);
+        b2.deposit(amts, _legValues(amts, 500e18), BOB);
 
         // Both preview 500 shares against the SAME (untouched) reserve state → identical claims.
         uint256[] memory pA = b2.previewRedeem(500e18);
@@ -318,25 +345,35 @@ contract StockBasketTest is Test {
         amts[0] = 1e18;
         vm.prank(ALICE);
         vm.expectRevert(bytes(unicode"Only vault / 仅限金库"));
-        basket.deposit(amts, 1e18, ALICE);
+        basket.deposit(amts, _legValues(amts, 1e18), ALICE);
     }
 
     function test_Deposit_LengthMismatch() public {
         uint256[] memory amts = new uint256[](N - 1); // wrong length
         vm.expectRevert(bytes(unicode"Length mismatch / 长度不匹配"));
-        basket.deposit(amts, 1e18, ALICE);
+        basket.deposit(amts, new uint256[](N), ALICE);
     }
 
-    function test_Deposit_ZeroSharesReverts() public {
+    function test_Deposit_LegValuesLengthMismatch() public {
         uint256[] memory amts = new uint256[](N);
-        vm.expectRevert(bytes(unicode"Zero shares / 份额为零"));
-        basket.deposit(amts, 0, ALICE);
+        vm.expectRevert(bytes(unicode"legValues length mismatch / legValues长度不匹配"));
+        basket.deposit(amts, new uint256[](N - 1), ALICE);
+    }
+
+    /// @dev H-02: a round where NOTHING lands mints nothing and returns 0 — it must not revert, or a single
+    ///      universally-broken stock set would brick the vault's `distribute`.
+    function test_Deposit_NothingLanded_MintsZero() public {
+        uint256[] memory amts = new uint256[](N); // every amount 0 => no pull attempted
+        uint256 minted = basket.deposit(amts, _legValues(amts, 1000e18), ALICE);
+        assertEq(minted, 0, "nothing landed => nothing minted");
+        assertEq(basket.totalSupply(), 0, "supply untouched");
+        assertEq(basket.balanceOf(ALICE), 0, "no shares to ALICE");
     }
 
     function test_Deposit_ZeroToReverts() public {
         uint256[] memory amts = new uint256[](N);
         vm.expectRevert(bytes(unicode"Zero address / 零地址"));
-        basket.deposit(amts, 1e18, address(0));
+        basket.deposit(amts, _legValues(amts, 1e18), address(0));
     }
 
     // ── 7. setVault one-shot / onlyOwner ────────────────────────────────────────
@@ -450,7 +487,7 @@ contract StockBasketTest is Test {
         uint256[] memory amts = new uint256[](2);
         amts[0] = 100e18;
         amts[1] = 100e18;
-        b.deposit(amts, 1000e18, ALICE);
+        b.deposit(amts, _legValues(amts, 1000e18), ALICE);
 
         // Sanity: without the attack, redeem works and pays BOTH stocks.
         vm.prank(ALICE);
@@ -497,7 +534,7 @@ contract StockBasketTest is Test {
         amts[0] = 100e18;
         amts[1] = 100e18;
         amts[2] = 100e18;
-        b.deposit(amts, 1000e18, ALICE); // transferFrom works (pausable only pauses `transfer`)
+        b.deposit(amts, _legValues(amts, 1000e18), ALICE); // transferFrom works (pausable only pauses `transfer`)
 
         // Pause the middle stock: its redeem payout (transfer) now reverts.
         ps.setPaused(true);
@@ -524,7 +561,11 @@ contract StockBasketTest is Test {
     /// @dev Post-L4, a deposit-reentrant stock is NEUTRALIZED, not fatal (symmetric with {redeem}'s S3): its
     ///      re-entrant `redeem` still hits the `nonReentrant` guard and reverts (no double redemption), but
     ///      the best-effort per-stock try/catch in {deposit} now CATCHES that revert and SKIPS only the
-    ///      malicious leg — the honest leg is still pulled and shares still mint == `sharesToMint`.
+    ///      malicious leg — the honest leg is still pulled.
+    ///
+    ///      AUDIT H-02: the skipped leg's VALUE is no longer minted. Previously `deposit` minted the whole
+    ///      round regardless, so supply grew while reserves did not and every existing holder was diluted by
+    ///      the skipped leg's weight. Now only the honest leg's half is minted.
     function test_Deposit_ReentrantStock_NeutralizedAndSkipped() public {
         MaliciousDepositReentrantStock mal = new MaliciousDepositReentrantStock();
         address[] memory stx = new address[](2);
@@ -544,18 +585,22 @@ contract StockBasketTest is Test {
         uint256[] memory amts = new uint256[](2);
         amts[0] = 100e18;
         amts[1] = 100e18;
-        uint256 minted = b.deposit(amts, 1000e18, ALICE); // no revert now
+        uint256 minted = b.deposit(amts, _legValues(amts, 1000e18), ALICE); // no revert now
 
-        assertEq(minted, 1000e18, "shares minted == sharesToMint despite the skipped leg");
-        assertEq(b.totalSupply(), 1000e18, "supply == shares (no double mint / no double redeem)");
-        assertEq(b.balanceOf(ALICE), 1000e18, "recipient got the shares");
+        // H-02: only the leg that LANDED is minted (500e18 of the 1000e18 round), never the full round.
+        assertEq(minted, 500e18, "only the landed leg's value is minted");
+        assertEq(b.totalSupply(), 500e18, "supply tracks reserves (no dilution from the skip)");
+        assertEq(b.balanceOf(ALICE), 500e18, "recipient got only the backed shares");
         // Honest leg pulled; malicious (reverting) leg skipped => its reserve stays 0.
         assertEq(s0.balanceOf(address(b)), 100e18, "honest stock 0 pulled in");
         assertEq(mal.balanceOf(address(b)), 0, "malicious leg skipped (reserve stays lighter)");
     }
 
     /// @dev L4 (non-reentrant): a plain paused / blacklisting stock whose `transferFrom` reverts is likewise
-    ///      SKIPPED best-effort — deposit still mints and the healthy legs still land.
+    ///      SKIPPED best-effort — deposit does not revert and the healthy legs still land.
+    ///
+    ///      AUDIT H-02: it mints only the healthy leg's value. This test previously asserted the buggy
+    ///      behaviour (`minted == 1000e18` with one leg's reserve at 0), which is precisely the dilution.
     function test_Deposit_BlacklistStockSkipped_BestEffort() public {
         RevertingTransferFromStock bad = new RevertingTransferFromStock();
         address[] memory stx = new address[](2);
@@ -572,11 +617,48 @@ contract StockBasketTest is Test {
         uint256[] memory amts = new uint256[](2);
         amts[0] = 100e18;
         amts[1] = 100e18;
-        uint256 minted = b.deposit(amts, 1000e18, ALICE); // must NOT revert
+        uint256 minted = b.deposit(amts, _legValues(amts, 1000e18), ALICE); // must NOT revert
 
-        assertEq(minted, 1000e18, "shares still minted");
+        assertEq(minted, 500e18, "only the healthy leg's value minted (H-02: no dilution)");
         assertEq(s0.balanceOf(address(b)), 100e18, "healthy leg pulled");
         assertEq(bad.balanceOf(address(b)), 0, "blacklisting leg skipped");
+    }
+
+    /// @dev H-02 regression: a skipped leg must not dilute holders from a PRIOR healthy round. Round 1 lands
+    ///      both legs (1000e18 of value); round 2 loses one, so only 500e18 lands.
+    ///
+    ///      The invariant is `totalSupply == total value that actually landed`. Asserting a single stock's
+    ///      per-share backing would be wrong here: round 2 adds only stock 0, so stock-0 backing legitimately
+    ///      RISES. What must never happen is a prior holder's claim shrinking — under the old full-round mint
+    ///      supply would be 2000e18 and ALICE's stock-0 claim would stay flat at 100e18 instead of growing.
+    function test_Deposit_SkippedLeg_DoesNotDilutePriorHolders() public {
+        RevertingTransferFromStock bad = new RevertingTransferFromStock();
+        address[] memory stx = new address[](2);
+        stx[0] = address(s0);
+        stx[1] = address(bad);
+        StockBasket b = new StockBasket("BE", "BE", stx);
+        b.setVault(address(this));
+
+        s0.approve(address(b), type(uint256).max);
+        bad.mint(address(this), 1_000e18);
+        bad.approve(address(b), type(uint256).max);
+
+        uint256[] memory amts = new uint256[](2);
+        amts[0] = 100e18;
+        amts[1] = 100e18;
+
+        // Round 1: both legs land — 1000e18 of value in, 1000e18 shares out.
+        b.deposit(amts, _legValues(amts, 1000e18), ALICE);
+        uint256 aliceClaimBefore = b.previewRedeem(b.balanceOf(ALICE))[0];
+
+        // Round 2: the second leg now reverts on transferFrom, so only 500e18 of value lands.
+        bad.setRevert(true);
+        uint256 minted2 = b.deposit(amts, _legValues(amts, 1000e18), BOB);
+
+        assertEq(minted2, 500e18, "round 2 mints only the landed half");
+        assertEq(b.totalSupply(), 1500e18, "supply == total value that actually landed");
+        // Prior holder is never worse off: her claim grows with the round-2 stock that DID land.
+        assertGt(b.previewRedeem(b.balanceOf(ALICE))[0], aliceClaimBefore, "prior holder not diluted");
     }
 
     // ── S7: renounceOwnership is disabled ───────────────────────────────────────

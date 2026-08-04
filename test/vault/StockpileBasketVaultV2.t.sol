@@ -307,6 +307,101 @@ contract StockpileBasketVaultV2Test is Test {
         v.distribute(_minOut3(), block.timestamp + 1);
     }
 
+    // ── AUDIT H-01: creator-side grid revenue is claimable, not stranded ─────────
+
+    /// @dev The vault calls `createGrid` from itself, so the UGM records IT as the grid `creator` and
+    ///      credits it — pull-based — with seat-sale proceeds and the creator share of Harberger tax.
+    ///      Without {claimGridPayout} every unit of that was locked in the UGM forever: only the creator
+    ///      may call `claimPayout`, and `emergencyWithdrawToken` reaches only tokens the vault HOLDS.
+    function testClaimGridPayoutPullsCreatorRevenue() public {
+        StockpileBasketVaultV2 v = _newVault(address(new MockTaxToken(100)), 600, 0);
+        _setupAndRegister(v);
+
+        // Simulate accrued creator revenue: the UGM custodies the WBNB and credits it to the vault.
+        uint256 revenue = 3 ether;
+        vm.deal(address(this), revenue);
+        wbnb.deposit{value: revenue}();
+        wbnb.transfer(address(ugm), revenue);
+        ugm.seedPayout(address(wbnb), revenue);
+
+        assertEq(v.pendingDistribute(), 0, "vault holds nothing yet");
+
+        uint256 claimed = v.claimGridPayout(address(wbnb)); // PERMISSIONLESS
+
+        assertEq(claimed, revenue, "claimed the full credited payout");
+        assertEq(wbnb.balanceOf(address(v)), revenue, "revenue now sits on the vault");
+        assertEq(v.pendingDistribute(), revenue, "counted as pending, ready for the next distribute");
+        assertEq(ugm.payoutOf(address(wbnb)), 0, "UGM credit consumed");
+    }
+
+    /// @dev Claimed revenue is ordinary vault WBNB from there on: the next {distribute} treats it exactly
+    ///      like a fresh fee receipt and forwards it to seat holders.
+    function testClaimedGridPayoutFlowsThroughDistribute() public {
+        StockpileBasketVaultV2 v = _newVault(address(new MockTaxToken(100)), 1000, 0);
+        _setupAndRegister(v);
+
+        uint256 revenue = 2 ether;
+        vm.deal(address(this), revenue);
+        wbnb.deposit{value: revenue}();
+        wbnb.transfer(address(ugm), revenue);
+        ugm.seedPayout(address(wbnb), revenue);
+        v.claimGridPayout(address(wbnb));
+
+        vm.prank(GUARDIAN);
+        uint256 minted = v.distribute(_minOut3(), block.timestamp + 1);
+
+        uint256 expCommission = (revenue * 6) / 100;
+        assertEq(minted, revenue - expCommission, "claimed revenue distributed like a fee receipt");
+        assertEq(ugm.yieldByAsset(v.assetHash()), minted, "reached the grid");
+    }
+
+    /// @dev The real UGM reverts ("nothing") on a zero balance, so the claim is wrapped: a speculative call
+    ///      with nothing credited must return 0 rather than revert, keeping it safe for keepers/UIs to poll.
+    function testClaimGridPayoutNoopWhenNothingCredited() public {
+        StockpileBasketVaultV2 v = _newVault(address(new MockTaxToken(100)), 600, 0);
+        _setupAndRegister(v);
+
+        assertEq(v.claimGridPayout(address(wbnb)), 0, "no credit => 0, no revert");
+    }
+
+    function testClaimGridPayoutRevertsBeforeSetup() public {
+        StockpileBasketVaultV2 v = _newVault(address(new MockTaxToken(100)), 600, 0);
+        vm.expectRevert(bytes(unicode"Market not set up / 市场未建立"));
+        v.claimGridPayout(address(wbnb));
+    }
+
+    // ── AUDIT M-01: an unproductive round must not burn the interval ─────────────
+
+    /// @dev `lastDistribute` used to advance BEFORE the swaps, so one bad `minOut` (or a stale deadline)
+    ///      consumed the whole `minInterval` window while distributing nothing — a keeper could DoS
+    ///      distribution for up to {MAX_MIN_INTERVAL} (30 days), repeatedly.
+    function testUnproductiveRoundDoesNotBurnInterval() public {
+        StockpileBasketVaultV2 v = _newVault(address(new MockTaxToken(100)), 600, 1 hours);
+        _setupAndRegister(v);
+        vm.warp(block.timestamp + 1 hours); // clear the initial gate
+
+        vm.deal(address(v), 5 ether);
+
+        // Every leg breaches an unreachable slippage floor => all skipped => nothing distributed.
+        uint256[] memory tooHigh = new uint256[](3);
+        tooHigh[0] = type(uint256).max;
+        tooHigh[1] = type(uint256).max;
+        tooHigh[2] = type(uint256).max;
+
+        vm.prank(GUARDIAN);
+        uint256 minted = v.distribute(tooHigh, block.timestamp + 1);
+
+        assertEq(minted, 0, "nothing distributed");
+        assertEq(v.lastDistribute(), 0, "time-gate NOT consumed by an unproductive round");
+        assertEq(v.pendingDistribute(), 5 ether, "the WBNB is retained, untaxed");
+
+        // Immediately retryable with a reachable floor — no 1-hour lockout.
+        vm.prank(GUARDIAN);
+        uint256 minted2 = v.distribute(_minOut3(), block.timestamp + 1);
+        assertGt(minted2, 0, "retry succeeds in the same block");
+        assertEq(v.lastDistribute(), block.timestamp, "gate advances only on a productive round");
+    }
+
     // ── commission = Flap Rule-001 formula for taxRate ∈ {50,100,300,1000} ───────
 
     function _commissionFor(uint16 taxRate, uint16 commissionBps) internal returns (uint256 commission) {
@@ -741,6 +836,31 @@ contract StockpileBasketVaultV2Test is Test {
         vm.prank(makeAddr("rando"));
         vm.expectRevert(bytes(unicode"Only self / 仅限自身"));
         v.swapLeg(0, 1, 0, block.timestamp + 1);
+    }
+
+    /// @dev {approveStock} exists only so {_depositToBasket} can isolate a per-leg approval (M-05). It must
+    ///      be unreachable from outside, or anyone could hand an arbitrary spender an allowance over the
+    ///      vault's stock balances.
+    function testApproveStockOnlySelfReverts() public {
+        StockpileBasketVaultV2 v = _newVault(address(new MockTaxToken(100)), 600, 0);
+        address attacker = makeAddr("rando");
+        vm.prank(attacker);
+        vm.expectRevert(bytes(unicode"Only self / 仅限自身"));
+        v.approveStock(address(s0), attacker, type(uint256).max);
+    }
+
+    /// @dev The swap path is reachable ONLY through the two keeper entrypoints, and the router allowance is
+    ///      reset to 0 at the end of every round — so no standing approval survives a distribute for anyone
+    ///      to exploit. This is the control H-03 relies on: keeper appointment is Guardian-only.
+    function testRouterAllowanceResetAfterDistribute() public {
+        StockpileBasketVaultV2 v = _newVault(address(new MockTaxToken(100)), 600, 0);
+        _setupAndRegister(v);
+        vm.deal(address(v), 5 ether);
+
+        vm.prank(GUARDIAN);
+        v.distribute(_minOut3(), block.timestamp + 1);
+
+        assertEq(wbnb.allowance(address(v), address(router)), 0, "no standing router allowance");
     }
 
     function testBasketPullOnlySelfReverts() public {

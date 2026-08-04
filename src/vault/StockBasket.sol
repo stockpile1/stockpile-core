@@ -19,10 +19,11 @@ import {SafeERC20} from "@openzeppelin/token/ERC20/utils/SafeERC20.sol";
 ///
 ///   • A vault (the sole minter, set once via {setVault}) periodically swaps a WBNB fee stream into
 ///     the `N` stocks, then calls {deposit}: it transfers the freshly-bought stocks into the basket
-///     and mints `sharesToMint` new shares. The vault sizes `sharesToMint` to the **WBNB value it
-///     spent that round**, so one share always represents the same amount of value put in, regardless
-///     of which stocks were bought or how their prices move. This is the fairness anchor and it is
-///     ORACLE-FREE: the basket never needs to price a stock.
+///     and mints new shares sized to the **WBNB value that actually landed** — the per-leg spend of
+///     every stock whose transfer into the basket succeeded. One share therefore always represents the
+///     same amount of value put in, regardless of which stocks were bought, how their prices move, or
+///     whether some leg had to be skipped. This is the fairness anchor and it is ORACLE-FREE: the
+///     basket never needs to price a stock.
 ///
 ///   • Seat holders across every grid receive these basket shares as yield. To realize them, a holder
 ///     calls {redeem}: it burns their `shares` and returns `shares / totalSupply` of the basket's
@@ -65,6 +66,9 @@ contract StockBasket is ERC20, ReentrancyGuard, Ownable {
     event VaultSet(address indexed vault);
     /// @notice Emitted on each {deposit}: the vault-supplied stock amounts pulled in and the shares minted.
     event Deposited(address indexed from, address indexed to, uint256[] amounts, uint256 sharesMinted);
+    /// @notice Emitted when a stock pull is skipped in {deposit} (paused / blacklisting / reverting stock).
+    ///         Its `legValue` is NOT minted, so the skip cannot dilute existing holders (AUDIT H-02).
+    event PullSkipped(uint256 indexed legIndex, address indexed stock, uint256 amount, uint256 legValue);
     /// @notice Emitted on each {redeem}: the shares burned and the pro-rata stock amounts paid out.
     event Redeemed(address indexed from, address indexed to, uint256 shares, uint256[] amounts);
 
@@ -122,28 +126,38 @@ contract StockBasket is ERC20, ReentrancyGuard, Ownable {
 
     // ── Mint path (vault-only) ───────────────────────────────────────────────
 
-    /// @notice Pull `amounts[i]` of each underlying stock from the caller (the {vault}) and mint
-    ///         `sharesToMint` new basket shares to `to`.
+    /// @notice Pull `amounts[i]` of each underlying stock from the caller (the {vault}) and mint shares to
+    ///         `to` sized to the value of the legs that ACTUALLY landed: `sum(legValues[i])` over the
+    ///         successful pulls only.
     /// @dev    The caller MUST have approved this basket to move each `amounts[i]`. Reserves are read
     ///         via `balanceOf` at redeem time, so NO reserves variable is written here — a fee-on-transfer
     ///         stock that delivers less than `amounts[i]` is handled naturally (the basket simply holds,
-    ///         and later redeems, whatever actually arrived). `sharesToMint` is the vault's WBNB value
-    ///         spent this round; sizing shares to value-in is what keeps redemptions fair (see contract
-    ///         NatSpec). Effects (mint) follow the interactions (pull) here because the pulls are from the
-    ///         trusted vault and `_mint` touches only this basket's own supply — there is no external
-    ///         call after the mint to re-enter.
-    /// @param  amounts      Per-stock amount to pull, positionally paired with {stocks} (same length).
-    /// @param  sharesToMint Basket shares to mint (the WBNB value spent this round); must be > 0.
-    /// @param  to           Recipient of the freshly-minted shares (non-zero).
-    /// @return minted       The number of shares minted (== `sharesToMint`).
-    function deposit(uint256[] calldata amounts, uint256 sharesToMint, address to)
+    ///         and later redeems, whatever actually arrived). Effects (mint) follow the interactions (pull)
+    ///         here because the pulls are from the trusted vault and `_mint` touches only this basket's own
+    ///         supply — there is no external call after the mint to re-enter.
+    ///
+    ///         SHARES ARE SIZED TO VALUE THAT LANDED (AUDIT H-02). `legValues[i]` is the vault's WBNB spend
+    ///         on leg `i` this round, and a leg only contributes to the mint if its pull SUCCEEDED. This
+    ///         preserves the contract's fairness anchor — one share always represents the same amount of
+    ///         value actually put in — even when a paused / blacklisting stock is skipped. Minting the full
+    ///         round value regardless (the previous behaviour) grew supply without growing reserves and so
+    ///         diluted every existing holder by the skipped leg's weight.
+    ///
+    ///         A round where EVERY pull fails mints nothing and returns 0 rather than reverting, so one
+    ///         universally-broken stock set cannot brick the vault's `distribute`.
+    /// @param  amounts   Per-stock amount to pull, positionally paired with {stocks} (same length).
+    /// @param  legValues Per-stock WBNB value backing `amounts[i]`, positionally paired with {stocks}.
+    ///                   Only entries whose pull succeeds are minted.
+    /// @param  to        Recipient of the freshly-minted shares (non-zero).
+    /// @return minted    Shares minted == summed `legValues` of the legs that landed (0 if none did).
+    function deposit(uint256[] calldata amounts, uint256[] calldata legValues, address to)
         external
         onlyVault
         nonReentrant
         returns (uint256 minted)
     {
         require(amounts.length == stocks.length, unicode"Length mismatch / 长度不匹配");
-        require(sharesToMint > 0, unicode"Zero shares / 份额为零");
+        require(legValues.length == stocks.length, unicode"legValues length mismatch / legValues长度不匹配");
         require(to != address(0), unicode"Zero address / 零地址");
 
         for (uint256 i = 0; i < amounts.length; i++) {
@@ -152,22 +166,24 @@ contract StockBasket is ERC20, ReentrancyGuard, Ownable {
             // deposit (and thus the vault's `distribute`) for a single unhealthy pool.
             //
             // BEST-EFFORT PER STOCK (L4): each non-zero pull is isolated in {_pull}'s external self-call
-            // inside a try/catch, so a single paused / blacklisting stock is SKIPPED — its reserve simply
-            // stays lighter while shares still mint == `sharesToMint` — instead of reverting the whole
-            // deposit. This is symmetric with {redeem}'s per-stock payout. `nonReentrant` (S4) still holds:
-            // a code-executing stock's transferFrom hook that re-enters {redeem} hits the guard and reverts,
-            // and that revert is CAUGHT here — the malicious leg is skipped (never a double redemption).
+            // inside a try/catch, so a single paused / blacklisting stock is SKIPPED instead of reverting
+            // the whole deposit. Its `legValues[i]` is then NOT credited, so the skip costs the round its
+            // own value rather than diluting existing holders (H-02). This is symmetric with {redeem}'s
+            // per-stock payout. `nonReentrant` (S4) still holds: a code-executing stock's transferFrom hook
+            // that re-enters {redeem} hits the guard and reverts, and that revert is CAUGHT here — the
+            // malicious leg is skipped (never a double redemption).
             if (amounts[i] > 0) {
-                try this._pull(stocks[i], msg.sender, amounts[i]) {}
-                catch {
-                    /* paused / blacklisting / reentrant stock: skip this leg (its reserve stays lighter) */
+                try this._pull(stocks[i], msg.sender, amounts[i]) {
+                    minted += legValues[i];
+                } catch {
+                    /* paused / blacklisting / reentrant stock: skip this leg AND its value */
+                    emit PullSkipped(i, stocks[i], amounts[i], legValues[i]);
                 }
             }
         }
 
-        _mint(to, sharesToMint);
-        emit Deposited(msg.sender, to, amounts, sharesToMint);
-        return sharesToMint;
+        if (minted > 0) _mint(to, minted);
+        emit Deposited(msg.sender, to, amounts, minted);
     }
 
     /// @notice Self-gated pull helper for {deposit}'s best-effort per-stock intake (L4): pulls `amt` of
