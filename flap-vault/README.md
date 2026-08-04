@@ -32,14 +32,14 @@ Plus the **immutable Flap prelude** in `src/flap/*` — canonical Flap interface
 (`VaultBase`, `VaultBaseV2`, `VaultFactoryBaseV2`, `IVault*`, `IPortal`, `IFlap*`, …). These are
 Flap-canonical and treated as trusted / out of authorship scope; **do not modify them.**
 
-### Prior design iterations (NOT the audit target)
+### Prior design iterations (removed)
 
-The other `src/*Vault*.sol` files are earlier design iterations kept in-tree for reference only. They are
-**not** part of the audit scope:
+Earlier design iterations have been **pruned from this tree** so it contains only the audit target and
+what it needs to build/test. For the record, the removed iterations were:
 
-- `src/StockpileVault.sol`, `src/StockpileVaultFactory.sol` — single-stock (WBNB→stock) vault iteration.
-- `src/MultiStockVault.sol` — multi-stock (WBNB → N stocks → N grids) iteration.
-- `src/StockpileBasketVault.sol` — the V1 basket vault, superseded by `StockpileBasketVaultV2.sol`.
+- `StockpileVault` / `StockpileVaultFactory` — single-stock (WBNB→stock) vault iteration.
+- `MultiStockVault` — multi-stock (WBNB → N stocks → N grids) iteration.
+- `StockpileBasketVault` — the V1 basket vault, superseded by `StockpileBasketVaultV2.sol`.
 
 ## Flap spec-checker result — COMPLIANT
 
@@ -51,8 +51,6 @@ The four conforming contracts passed Flap's official spec-checker across **rules
   COMPLIANT ✅"*, records the resolutions and the passing 219/219 non-fork suite. (The section-1 headline
   still shows the pre-fix v1 grade; the post-fix verdict at the bottom is the current status.)
 - The Flap rules themselves are vendored under [`audit/flap-rules/`](audit/flap-rules/) (001–009).
-- Additional internal reviews: `audit/BasketVault-audit-internal-v1.md`,
-  `audit/MultiStockVault-audit-internal-v1.md`.
 
 ## Build & test
 
@@ -65,12 +63,12 @@ cd flap-vault
 git submodule update --init --recursive
 
 forge build                              # compile (clean)
-forge test --no-match-path 'test/fork/*' # 219 unit tests, all pass
+forge test --no-match-path 'test/fork/*' # 92 unit tests, all pass
 forge test                               # includes BSC-fork tests (needs BSC_RPC_URL)
 forge build --sizes                      # EIP-170 runtime sizes
 ```
 
-The `test/fork/*` suites hit a BSC mainnet fork; set `BSC_RPC_URL` to run them. The 219 non-fork tests
+The `test/fork/*` suites hit a BSC mainnet fork; set `BSC_RPC_URL` to run them. The 92 non-fork tests
 need no network.
 
 ### Contract sizes (runtime, EIP-170 limit = 24,576 B)
@@ -86,5 +84,5 @@ need no network.
 
 - **BSC Testnet (chainId 97) factory:** `0x909f882aB74b168f9D971f65ccA88E4897a9361D`
 
-Deploy scripts live in `script/` (e.g. `DeployBasketVaultTestnet.s.sol`). Do not run `forge script` from
+Deploy scripts live in `script/` (`DeployFlapFactoryTestnet.s.sol`, `LaunchFlapVaultTestnet.s.sol`). Do not run `forge script` from
 the repository root — run it from inside `flap-vault/` so the OZ v4.9.6 remappings resolve correctly.
