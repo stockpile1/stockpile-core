@@ -47,9 +47,19 @@ contract UnifiedGridManager is IGrid, Ownable, ReentrancyGuard {
     uint256 public constant MAX_PROTOCOL_BPS = 5000;
     uint256 public constant ADAPTER_COLLECT_GAS_CAP = 600_000;
     uint256 public constant GOVERNANCE_HOOK_GAS_CAP = 150_000;
-    /// @dev A holder cannot re-price (or the freshly-acquired seat be re-priced) within this
-    ///      window of acquiring / the last price change. Buyouts are NEVER gated by it — seats
-    ///      remain buyable at the stated price at any time.
+    /// @dev Friction on the FREE re-pricing path: {setPrice} is refused within this window of acquiring
+    ///      the seat or of its last price change. Buyouts are NEVER gated by it — seats remain buyable at
+    ///      the stated price at any time.
+    ///
+    ///      NOT an absolute invariant, and deliberately so. A holder in a hurry can still re-price by
+    ///      {abandonSeat} + {buySeat} on the now-vacant seat: at `elapsed == 0` the Dutch clearing price
+    ///      is the full preserved price, and {_routeDutchClearing} pays it back to them minus
+    ///      `protocolSeatSaleBps + creatorSeatSaleBps`. So the cooldown is not bypassed for free — it is
+    ///      bought out, at those bps of the seat's own self-assessed price, every time.
+    ///
+    ///      That is the intended shape: no counterparty can be harmed by an early re-price (buyouts are
+    ///      never cooldown-gated and carry a `maxPrice` slippage bound), the seat must transit a publicly
+    ///      claimable vacancy at its full price, and the escape hatch is priced rather than free.
     uint256 public constant PRICE_COOLDOWN = 20 minutes;
     /// @dev Default Dutch decay window applied when a grid is created with forfeitureDuration 0.
     uint32 public constant DEFAULT_FORFEITURE_DURATION = 10 minutes;
@@ -460,8 +470,9 @@ contract UnifiedGridManager is IGrid, Ownable, ReentrancyGuard {
     }
 
     /// @notice Update a seat's self-assessed price (holder only).
-    /// @dev Gated by `PRICE_COOLDOWN`: a holder cannot re-price within the window of acquiring the
-    ///      seat or its last price change. Buyouts are never cooldown-gated.
+    /// @dev Gated by `PRICE_COOLDOWN`: this FREE re-pricing path is refused within the window of
+    ///      acquiring the seat or its last price change. Buyouts are never cooldown-gated. The window is
+    ///      friction, not an invariant — see {PRICE_COOLDOWN} for the priced escape hatch.
     function setPrice(uint256 gridId, uint256 seatId, uint128 newPrice) external nonReentrant {
         require(newPrice > 0, "newPrice");
         GridConfig memory c = _configs[gridId];
