@@ -239,11 +239,22 @@ contract FlapVaultBackedLaunchForkTest is FlapBSCFixture {
             assertLt(realized, (quoted * 120) / 100, "realized within 20% above the TWAP quote");
         }
 
-        // Real WBNB→USDT→stock swaps happened: the basket physically holds all 4 stocks.
-        assertGt(IERC20(SPCXB).balanceOf(basketAddr), 0, "basket holds SPCXB");
-        assertGt(IERC20(NVDAB).balanceOf(basketAddr), 0, "basket holds NVDAB");
-        assertGt(IERC20(AAPLB).balanceOf(basketAddr), 0, "basket holds AAPLB");
-        assertGt(IERC20(GMEON).balanceOf(basketAddr), 0, "basket holds GMEon");
+        // Real WBNB→USDT→stock swaps happened. NOT "all four landed": this fork runs at the LATEST block
+        // against live pools, and the TWAP floor is allowed — required, even — to refuse a leg whose spot
+        // has moved more than `maxSlippageBps` (3%) below the 5-minute mean. Demanding four hits would be
+        // asserting market conditions, and would fail on a perfectly healthy contract. Assert what the
+        // contract actually guarantees, and name the legs that skipped so a run is still diagnosable.
+        {
+            address[4] memory legs = [SPCXB, NVDAB, AAPLB, GMEON];
+            string[4] memory syms = ["SPCXB", "NVDAB", "AAPLB", "GMEon"];
+            uint256 landed;
+            for (uint256 i = 0; i < 4; i++) {
+                if (IERC20(legs[i]).balanceOf(basketAddr) > 0) landed++;
+                else emit log_named_string("leg SKIPPED (floor unreachable at this block)", syms[i]);
+            }
+            emit log_named_uint("legs that landed", landed);
+            assertGt(landed, 0, "at least one leg must land, else the round is vacuous");
+        }
 
         // Grid fed: the whole minted basket forwarded into the vault's single grid.
         assertEq(ugm.yieldByAsset(assetHash), basketMinted, "grid received all basket shares");
@@ -258,12 +269,24 @@ contract FlapVaultBackedLaunchForkTest is FlapBSCFixture {
         uint256[] memory got = basket.redeem(redeemShares, holder);
 
         assertEq(got.length, 4, "4 stocks returned");
-        assertGt(IERC20(SPCXB).balanceOf(holder), 0, "holder got SPCXB");
-        assertGt(IERC20(NVDAB).balanceOf(holder), 0, "holder got NVDAB");
-        assertGt(IERC20(AAPLB).balanceOf(holder), 0, "holder got AAPLB");
-        assertGt(IERC20(GMEON).balanceOf(holder), 0, "holder got GMEon");
+        _assertHolderGotEveryHeldStock(basketAddr, holder);
         assertEq(basket.totalSupply(), basketMinted - redeemShares, "supply burned by redeem");
         assertEq(IERC20(SPCXB).balanceOf(holder), got[0], "SPCXB out matches return value");
+    }
+
+    /// @dev The holder must receive a slice of every stock the BASKET actually holds. A leg the oracle
+    ///      refused this round simply is not in the basket yet, so it is not expected in the payout.
+    ///      Extracted into its own frame purely to keep the end-to-end test off "stack too deep".
+    function _assertHolderGotEveryHeldStock(address basketAddr, address holder) internal {
+        address[4] memory legs = [SPCXB, NVDAB, AAPLB, GMEON];
+        uint256 paid;
+        for (uint256 i = 0; i < 4; i++) {
+            if (IERC20(legs[i]).balanceOf(basketAddr) > 0) {
+                assertGt(IERC20(legs[i]).balanceOf(holder), 0, "holder got every stock the basket held");
+                paid++;
+            }
+        }
+        assertGt(paid, 0, "holder received at least one stock");
     }
 
     // ─────────────────────────────────────────────────────────────────────────

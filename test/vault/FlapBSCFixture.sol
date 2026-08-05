@@ -237,9 +237,18 @@ abstract contract FlapBSCFixture is Test, VanityHelper {
     ///            _forkBSCMainnet();
     ///        }
     ///        ```
+    /// @dev Forks at the LATEST block by default, which also makes these runs a live smoke test against
+    ///      production Flap + PancakeSwap. The cost is that anything price-dependent becomes
+    ///      non-deterministic: the vault's TWAP floor legitimately refuses a leg whose spot has drifted
+    ///      more than `maxSlippageBps` below the 5-minute mean, so a healthy contract can still skip legs
+    ///      on a volatile block. Assertions here must therefore test contract guarantees, not market
+    ///      conditions. Set `BSC_FORK_BLOCK` to pin a block when you need a reproducible run (requires an
+    ///      archive RPC for anything but very recent history).
     function _forkBSCMainnet() internal {
         string memory rpcUrl = vm.envOr("BSC_RPC_URL", string("https://bsc-dataseed.bnbchain.org"));
-        vm.createSelectFork(rpcUrl);
+        uint256 forkBlock = vm.envOr("BSC_FORK_BLOCK", uint256(0));
+        if (forkBlock == 0) vm.createSelectFork(rpcUrl);
+        else vm.createSelectFork(rpcUrl, forkBlock);
 
         portal = IPortal(PORTAL);
         vaultPortal = IVaultPortal(VAULT_PORTAL);
