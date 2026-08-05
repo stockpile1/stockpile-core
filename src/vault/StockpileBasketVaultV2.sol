@@ -162,10 +162,12 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
     /// @notice Max stock legs a TRIGGERED distribute may carry. The Flap Trigger Service hard-caps every
     ///         callback at 2,000,000 gas (Rule 008 §4) and a callback that exceeds it is recorded FAILED.
     ///
-    ///         Measured against LIVE PancakeSwap V3 pools with the TWAP floor enabled: a 4-leg distribute
-    ///         costs ~1.82M, i.e. ~455k per leg. Adding the callback's re-arm puts the production
-    ///         configuration near 1.9M — inside the budget, but with little room, so a 5th leg (~2.27M)
-    ///         cannot fit. Vaults with more legs must use the keeper path ({distribute} /
+    ///         Measured END-TO-END against LIVE PancakeSwap V3 pools, TWAP floor and re-arm included:
+    ///         the production 4-leg callback costs **1.86M on its first round** and less thereafter (the
+    ///         basket allowance is then already standing). ~450k of that is per leg, so a 5th leg cannot
+    ///         fit. Run `test_TriggerCallback_FitsGasCap_OnLiveLiquidity` to re-measure after any change:
+    ///         the figure moves by tens of thousands with pool state alone, since a swap crossing more
+    ///         initialized ticks costs more. Vaults with more legs must use the keeper path ({distribute} /
     ///         {distributeUniform}), which has no such cap; {scheduleDistribute} rejects them up front
     ///         rather than letting the service burn a fee on a callback that can never succeed.
     ///
@@ -818,22 +820,23 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
             stx[i] = _stocks[i].stock;
             amounts[i] = IERC20(stx[i]).balanceOf(address(this)); // L-03: sweep this round's buy + any residue
             if (amounts[i] == 0) continue;
-            try this.approveStock(stx[i], _basket, amounts[i]) {}
-            catch {
-                // Un-approvable stock: drop the leg entirely so the basket neither pulls it nor credits it.
-                emit LegSkipped(i, stx[i], legSpend[i], "approve");
-                amounts[i] = 0;
-                legSpend[i] = 0;
+            // Approve LAZILY and for the full range, then leave it standing. Re-approving the exact amount
+            // every round and resetting it afterwards cost two zero<->non-zero SSTOREs per leg per round —
+            // ~100k gas on a 4-leg basket, which the 2,000,000-gas trigger callback cannot spare. The
+            // standing allowance is to the vault's OWN basket, whose only pull path is `_pull`, reachable
+            // solely from `deposit`, which is `onlyVault`: nobody but this vault can ever exercise it.
+            if (IERC20(stx[i]).allowance(address(this), _basket) < amounts[i]) {
+                try this.approveStock(stx[i], _basket, type(uint256).max) {}
+                catch {
+                    // Un-approvable stock: drop the leg so the basket neither pulls it nor credits it.
+                    emit LegSkipped(i, stx[i], legSpend[i], "approve");
+                    amounts[i] = 0;
+                    legSpend[i] = 0;
+                }
             }
         }
 
         minted = StockBasket(_basket).deposit(amounts, legSpend, address(this));
-
-        for (uint256 i = 0; i < n; i++) {
-            if (amounts[i] > 0) {
-                try this.approveStock(stx[i], _basket, 0) {} catch { /* dangling allowance to our own basket */ }
-            }
-        }
     }
 
     /// @notice Self-gated approval helper for {_depositToBasket}'s isolated per-leg approvals (M-05).
@@ -922,11 +925,15 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
     ///         one fee per distribution cycle and makes repeated calls a no-op rather than a drain vector.
     /// @return requestId The Trigger Service request id now outstanding.
     function scheduleDistribute() external nonReentrant returns (uint256 requestId) {
-        return _schedule();
+        return _schedule(lastDistribute);
     }
 
     /// @dev Shared scheduling body. Private so {trigger} can re-arm from inside its own guarded frame.
-    function _schedule() private returns (uint256 requestId) {
+    /// @param anchor Timestamp the next slot is measured from — `anchor + minInterval`. Callers pass
+    ///               {lastDistribute} normally, or `block.timestamp` from {trigger} when the callback is
+    ///               about to advance it (AUDIT v12: anchoring on the STALE value made the new request
+    ///               eligible immediately, so it fired, failed the re-checked gate, and burned a fee).
+    function _schedule(uint256 anchor) private returns (uint256 requestId) {
         require(basket != address(0), unicode"No market / 市场未建立");
         require(!triggerPending, unicode"Already scheduled / 已排程");
         require(_stocks.length <= MAX_TRIGGER_STOCKS, unicode"Too many legs / 腿数过多");
@@ -936,7 +943,7 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
         require(address(this).balance >= fee, unicode"BNB too low for fee / BNB不足付费");
 
         // `executeAfter` is a LOWER BOUND, not an appointment: ask for the moment the time-gate opens.
-        uint256 due = lastDistribute + minInterval;
+        uint256 due = anchor + minInterval;
         uint64 executeAfter = due > block.timestamp ? uint64(due) : uint64(block.timestamp);
 
         requestId = IFlapTriggerService(ts).requestTrigger{value: fee}(executeAfter);
@@ -972,16 +979,24 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
         triggerPending = false;
         pendingRequestId = 0;
 
-        // Re-arm before the swaps so the fee comes out of native BNB while it is still unwrapped.
-        // Best-effort: a fee shortfall must leave the vault re-armable by anyone, not fail the callback.
-        try this.rearm() {} catch { /* re-arm later via the permissionless scheduleDistribute() */ }
+        // Re-validate at execution time (§3) rather than trusting the schedule. Decide BEFORE re-arming,
+        // because the next slot must be measured from the round this callback is about to run.
+        bool due = block.timestamp >= lastDistribute + minInterval;
+        bool funded = IERC20(wbnb).balanceOf(address(this)) + address(this).balance > 0;
 
-        // Re-validate at execution time (§3) rather than trusting the schedule.
-        if (block.timestamp < lastDistribute + minInterval) {
+        // Re-arm before the swaps so the fee comes out of native BNB while it is still unwrapped.
+        // Anchor on now when we are about to distribute — anchoring on the stale {lastDistribute} would
+        // make the new request eligible instantly, so it would fire, fail this same gate and waste its
+        // fee every single cycle (AUDIT v12). Best-effort: a fee shortfall must leave the vault
+        // re-armable by anyone, not fail the callback.
+        try this.rearm(due && funded ? block.timestamp : lastDistribute) {}
+        catch { /* re-arm later via the permissionless scheduleDistribute() */ }
+
+        if (!due) {
             emit TriggerSkipped(requestId, "too soon");
             return;
         }
-        if (IERC20(wbnb).balanceOf(address(this)) + address(this).balance == 0) {
+        if (!funded) {
             emit TriggerSkipped(requestId, "nothing to distribute");
             return;
         }
@@ -992,9 +1007,9 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
 
     /// @notice Self-gated re-arm helper so {trigger} can isolate a failing schedule in a try/catch.
     /// @dev    Callable ONLY by this contract, exactly like {swapLeg} / {approveStock}.
-    function rearm() external {
+    function rearm(uint256 anchor) external {
         require(msg.sender == address(this), unicode"Only self / 仅限自身");
-        _schedule();
+        _schedule(anchor);
     }
 
     /// @notice Guardian escape hatch: clear a stuck outstanding request so {scheduleDistribute} works again.

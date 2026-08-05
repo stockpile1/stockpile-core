@@ -706,8 +706,10 @@ contract StockpileBasketVaultV2Test is Test {
         v.trigger(requestId); // replay of a consumed id
     }
 
-    /// @dev Rule 008 §3 — delay-aware: `executeAfter` is a lower bound, so the callback re-checks the
-    ///      time-gate at execution time and distributes NOTHING rather than forcing the action.
+    /// @dev Rule 008 §3 — delay-aware: `executeAfter` is only a LOWER bound, so if the service fires the
+    ///      callback before the vault's own gate opens it must distribute nothing rather than force it.
+    ///      Driven by calling the callback directly as the service, since the re-armed request is now
+    ///      correctly dated in the future (see the v12 regression test below).
     function testTriggerSkipsWhenNotDue() public {
         MockTriggerService ts = _installTriggerService();
         StockpileBasketVaultV2 v = _newVault(address(new MockTaxToken(100)), 600, 1 hours);
@@ -715,17 +717,52 @@ contract StockpileBasketVaultV2Test is Test {
         vm.warp(block.timestamp + 1 hours);
         vm.deal(address(v), 5 ether);
 
-        // First cycle distributes and re-arms.
         uint256 id1 = v.scheduleDistribute();
         ts.fire(id1);
         uint256 spentAfterFirst = wbnb.balanceOf(treasury);
+        uint256 gateAfterFirst = v.lastDistribute();
 
-        // The service fires the re-armed request early (it only guarantees a lower bound).
+        // The service fires the re-armed request early (it only ever guarantees a lower bound).
         vm.deal(address(v), 5 ether);
         uint256 id2 = v.pendingRequestId();
-        assertTrue(ts.fire(id2), "callback must not revert when not due");
-        assertEq(wbnb.balanceOf(treasury), spentAfterFirst, "nothing distributed while inside the interval");
-        assertEq(v.lastDistribute(), block.timestamp, "time-gate untouched by the skipped round");
+        vm.prank(address(ts));
+        v.trigger(id2);
+
+        assertEq(wbnb.balanceOf(treasury), spentAfterFirst, "nothing distributed inside the interval");
+        assertEq(v.lastDistribute(), gateAfterFirst, "time-gate untouched by the skipped round");
+    }
+
+    /// @dev AUDIT v12: the callback re-arms BEFORE distributing (the fee must leave as native BNB before
+    ///      `_distribute` wraps the balance), so the next slot has to be anchored on the round about to
+    ///      run. Anchoring on the stale `lastDistribute` made every re-armed request eligible instantly:
+    ///      it fired, failed the re-checked gate, and burned a service fee — one wasted fee per cycle,
+    ///      taken out of the stream that belongs to seat holders.
+    function testRearmIsScheduledForTheNextSlotNotImmediately() public {
+        MockTriggerService ts = _installTriggerService();
+        StockpileBasketVaultV2 v = _newVault(address(new MockTaxToken(100)), 600, 1 hours);
+        _setupAndRegister(v);
+        vm.warp(block.timestamp + 1 hours);
+        vm.deal(address(v), 5 ether);
+
+        uint256 id1 = v.scheduleDistribute();
+        uint256 tDistribute = block.timestamp;
+        assertTrue(ts.fire(id1), "cycle ran");
+
+        // The re-armed request is dated one full interval out, not now.
+        uint256 id2 = v.pendingRequestId();
+        (, uint64 executeAfter,) = ts.requests(id2);
+        assertEq(uint256(executeAfter), tDistribute + 1 hours, "next slot anchored on this round");
+
+        // So the service cannot burn it immediately — exactly one fee per cycle, not two.
+        vm.expectRevert(bytes("MockTriggerService: too early"));
+        ts.fire(id2);
+        assertEq(ts.feesCollected(), 0.002 ether, "initial arm + one re-arm, no wasted third fee");
+
+        // And it becomes eligible exactly when the gate opens.
+        vm.warp(tDistribute + 1 hours);
+        vm.deal(address(v), 5 ether);
+        assertTrue(ts.fire(id2), "eligible once the interval elapses");
+        assertEq(v.lastDistribute(), block.timestamp, "second cycle distributed");
     }
 
     /// @dev Only one request may be outstanding — otherwise repeated permissionless calls would drain the
@@ -801,7 +838,7 @@ contract StockpileBasketVaultV2Test is Test {
         StockpileBasketVaultV2 v = _newVault(address(new MockTaxToken(100)), 600, 0);
         vm.prank(makeAddr("rando"));
         vm.expectRevert(bytes(unicode"Only self / 仅限自身"));
-        v.rearm();
+        v.rearm(0);
     }
 
     // ── commission = Flap Rule-001 formula for taxRate ∈ {50,100,300,1000} ───────
