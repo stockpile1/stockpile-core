@@ -11,6 +11,7 @@ import {StockpileBasketVaultV2} from "../../../src/vault/StockpileBasketVaultV2.
 import {StockBasket} from "../../../src/vault/StockBasket.sol";
 import {MockUGM} from "../mocks/MockUGM.sol";
 import {StockpileSlippageOracle} from "../../../src/vault/StockpileSlippageOracle.sol";
+import {MockTriggerService} from "../mocks/MockTriggerService.sol";
 
 /// @title FlapVaultBackedLaunch — TRUE Flap vault-backed launch, end-to-end on a BSC-mainnet fork
 ///
@@ -284,5 +285,47 @@ contract FlapVaultBackedLaunchForkTest is FlapBSCFixture {
         vm.prank(FLAP_GUARDIAN); // == _getGuardian() on chainid 56
         uint256 minted = vault.distributeUniform(0, block.timestamp + 300);
         assertGt(minted, 0, "guardian distribute works");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  Rule 008 §4 against LIVE liquidity: the triggered callback must fit 2M gas.
+    //
+    //  The unit suite measures this against MockV3Router, which is far cheaper than a real 2-hop V3 swap,
+    //  and the oracle adds an `observe()` per leg on top. This is the only measurement that reflects what
+    //  actually ships: the production 4-stock basket, real pools, real TWAP reads, and the callback's own
+    //  re-arm — the part the `distributeUniform` gas figure does NOT include.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    function test_TriggerCallback_FitsGasCap_OnLiveLiquidity() public {
+        address token = _launch();
+        StockpileBasketVaultV2 vault = StockpileBasketVaultV2(payable(factory.vaultOf(token)));
+        vault.setupMarket();
+        ugm.setApprovedAdapter(address(vault), true);
+        vault.registerWithGrid();
+
+        // The vault resolves the Trigger Service from block.chainid, so the stand-in must live AT the
+        // real mainnet address. It applies the service's own 2,000,000-gas cap to the callback.
+        address svc = 0xcf4EE25035CF883895110f367F5BA8172416a7F9; // chainId 56
+        vm.etch(svc, address(new MockTriggerService()).code);
+        MockTriggerService ts = MockTriggerService(payable(svc));
+        ts.setFee(0.001 ether);
+        ts.setMaxCallbackGas(2_000_000);
+
+        vm.deal(address(vault), FUND);
+
+        // Permissionless arm — no keeper is ever appointed in this test, which is the whole point.
+        vm.prank(makeAddr("anyone"));
+        uint256 requestId = vault.scheduleDistribute();
+
+        assertTrue(ts.fire(requestId), "callback must fit the 2M budget on live pools");
+
+        uint256 used = ts.lastCallbackGasUsed();
+        emit log_named_uint("REAL trigger callback gas (4 legs, live V3 + TWAP + re-arm)", used);
+        assertLt(used, 2_000_000, "Rule 008 s4: callback within the service's hard cap");
+
+        // And it actually did the work, with nobody holding a keeper role.
+        assertGt(IERC20(WBNB).balanceOf(treasury), 0, "commission skimmed");
+        assertGt(ugm.yieldByAsset(vault.assetHash()), 0, "grid fed via the Trigger Service alone");
+        assertTrue(vault.triggerPending(), "re-armed for the next cycle");
     }
 }

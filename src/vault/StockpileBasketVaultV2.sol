@@ -101,13 +101,20 @@ interface IStockBasketDeployer {
 /// @title StockpileBasketVaultV2
 /// @author The Stockpile Team
 /// @notice Per-token, Flap-conforming ({VaultBaseV2}) BeaconProxy vault. Flap sets it as a launched
-///         token's fee `marketAddress`; the token's BNB tax stream arrives as **native BNB**. A keeper
-///         calls {distribute}, which wraps the BNB, skims the Flap-recommended commission, swaps the
-///         remainder into a dynamic basket of "stock" tokens (each via a 2-hop PancakeSwap V3 route
-///         through USDT), DEPOSITS the bought stocks into this vault's OWN {StockBasket} index token
-///         (minting shares sized to the WBNB value spent), and forwards those shares into the vault's
-///         OWN single Stockpile grid through the UnifiedGridManager (UGM). Seat holders redeem one
-///         share for a pro-rata slice of ALL stocks at once.
+///         token's fee `marketAddress`; the token's BNB tax stream arrives as **native BNB**. A distribute
+///         wraps the BNB, skims the Flap-recommended commission, swaps the remainder into a dynamic basket
+///         of "stock" tokens (each via a 2-hop PancakeSwap V3 route through USDT), DEPOSITS the bought
+///         stocks into this vault's OWN {StockBasket} index token (minting shares sized to the WBNB value
+///         that actually landed), and forwards those shares into the vault's OWN single Stockpile grid
+///         through the UnifiedGridManager (UGM). Seat holders redeem one share for a pro-rata slice of
+///         ALL stocks at once.
+///
+///         TWO WAYS IN. {scheduleDistribute} is PERMISSIONLESS and arms the Flap Trigger Service, whose
+///         callback ({trigger}) runs the distribute — so the vault needs no appointed keeper and no
+///         off-chain bot. {distribute} / {distributeUniform} remain for Guardian-appointed keepers that
+///         want to supply their own per-leg slippage floors. Both bound every swap: the triggered path
+///         carries no caller floor, so it relies on {StockpileSlippageOracle}'s TWAP-derived one, and a
+///         leg with neither is SKIPPED rather than swapped unbounded.
 ///
 /// @dev  ── ONE TOKEN → ONE VAULT → ONE BASKET → ONE GRID ─────────────────────────
 ///
@@ -672,11 +679,16 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
 
     /// @dev Read the tax rate LAZILY behind the D18 codeless-token guard. Mutates {taxRateBps}/{taxRateKnown}
     ///      on the first successful read. Returns the bps to use for the commission formula (0 => 6% branch).
+    ///
+    ///      The call carries a 50,000-gas STIPEND (audit M-04). `taxToken` is attacker-influenceable in the
+    ///      general case — Flap launches are permissionless — and an unbounded loop in `taxRate()` would
+    ///      otherwise burn 63/64 of the gas available here, leaving the swap phase to run out of gas and
+    ///      reverting the whole distribute. It is a `view` getter, so the stipend is ample.
     function _currentTaxBps() private returns (uint256 bps) {
         if (taxRateKnown) return taxRateBps;
         address t = taxToken;
         if (t.code.length == 0) return 0; // D18: still codeless — try again next round
-        try ITaxToken(t).taxRate() returns (uint256 r) {
+        try ITaxToken(t).taxRate{gas: 50_000}() returns (uint256 r) {
             if (r > 0) {
                 taxRateBps = r > type(uint16).max ? type(uint16).max : uint16(r);
                 taxRateKnown = true;

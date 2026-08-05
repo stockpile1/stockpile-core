@@ -24,9 +24,10 @@ interface IPancakeV3PoolOracle {
 /// @dev  ── WHY THIS IS A SEPARATE CONTRACT ────────────────────────────────────────
 ///
 ///   {StockpileBasketVaultV2} sits within a few hundred bytes of the EIP-170 runtime limit, so the tick
-///   math below cannot live on the vault. Keeping it here also means the vault's audited money path is
-///   unchanged apart from one `view` call, and this contract holds NO funds and NO privileged state —
-///   it is pure computation over public pool data and can be reviewed in isolation.
+///   math below cannot live on the vault. Keeping it here also means the vault's money path gains only
+///   two `view` calls per distribute — one shared WBNB→USDT quote plus one per stock leg — and this
+///   contract holds NO funds and NO privileged state, so it is pure computation over public pool data
+///   and can be reviewed in isolation.
 ///
 ///   ── WHY TWAP, NOT SPOT ────────────────────────────────────────────────────────
 ///

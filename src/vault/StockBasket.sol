@@ -299,8 +299,17 @@ contract StockBasket is ERC20, ReentrancyGuard, Ownable {
 
     /// @dev The portion of `stock` the basket holds that is NOT already owed to a deferred claimant, i.e.
     ///      the base every pro-rata calculation must use.
+    /// @dev SATURATING on purpose. The subtraction cannot go negative through this contract's own
+    ///      accounting, but the stocks are launcher-chosen BEP-20s: a rebasing or balance-burning token
+    ///      can shrink `balanceOf` below what is already booked in {totalDeferred}. A plain subtraction
+    ///      would then revert, and because {redeem}, {previewRedeem} and {reserves} all read through here,
+    ///      the ENTIRE basket would brick for every holder and every stock — permanently, since
+    ///      {claimUnpaid} could not drain the booked amount either. Returning 0 degrades that stock's
+    ///      claim to nothing instead of taking the whole basket down with it.
     function _available(address stock) internal view returns (uint256) {
-        return IERC20(stock).balanceOf(address(this)) - totalDeferred[stock];
+        uint256 bal = IERC20(stock).balanceOf(address(this));
+        uint256 owed = totalDeferred[stock];
+        return bal > owed ? bal - owed : 0;
     }
 
     /// @notice Self-gated payout helper for {redeem}'s best-effort per-stock delivery: transfers `amount`
