@@ -6,6 +6,7 @@ import {Script, console2} from "forge-std/Script.sol";
 import {StockpileBasketVaultFactory} from "../src/vault/StockpileBasketVaultFactory.sol";
 import {MockMintableERC20} from "../test/vault/mocks/MockMintableERC20.sol";
 import {MockV3Router} from "../test/vault/mocks/MockV3Router.sol";
+import {MockSlippageOracle} from "../test/vault/mocks/MockSlippageOracle.sol";
 import {StockConfig} from "./StockConfig.sol";
 import {StockpileSlippageOracle} from "../src/vault/StockpileSlippageOracle.sol";
 import {BscAddresses} from "../src/config/BscAddresses.sol";
@@ -83,14 +84,26 @@ contract DeployVaultFactory is Script {
             revert("unsupported chain: run on 56 or 97, or set WBNB/USDT/UGM/ROUTER explicitly");
         }
 
-        // The TWAP slippage oracle every vault consults (AUDIT v9 Finding 2). It reads PancakeSwap V3
-        // pools directly, so it is wired to the real V3 factory on both chains; on testnet the mock
-        // router means its quotes are unused in a dry run, but the wiring stays identical to mainnet.
-        StockpileSlippageOracle oracle =
-            new StockpileSlippageOracle(BscAddresses.PANCAKE_V3_FACTORY, wbnb, usdt, fee);
+        // The slippage oracle every vault from this factory consults (AUDIT v9 Finding 2).
+        //
+        // MAINNET: the real {StockpileSlippageOracle}, reading PancakeSwap V3's TWAP.
+        //
+        // TESTNET: a stand-in. The real oracle would be wired to pools that do not exist there — USDT and
+        // the four stocks are mocks deployed seconds earlier, so `getPool` returns 0 and every quote
+        // reverts. That is fail-closed by design, but it means EVERY leg would be skipped and a triggered
+        // distribute would move nothing: the deployment would look healthy and quietly do nothing. The
+        // stand-in returns a reachable floor (90% of the hop input, matching MockV3Router's 1:1 rate), so
+        // the testnet flow exercises the same code path end-to-end. Override with ORACLE=0x… to point at
+        // a real oracle if you have seeded real pools.
+        address oracle = vm.envOr("ORACLE", address(0));
+        if (oracle == address(0)) {
+            oracle = block.chainid == 56
+                ? address(new StockpileSlippageOracle(BscAddresses.PANCAKE_V3_FACTORY, wbnb, usdt, fee))
+                : address(new MockSlippageOracle());
+        }
 
         StockpileBasketVaultFactory factory =
-            new StockpileBasketVaultFactory(wbnb, usdt, ugm, router, fee, address(oracle));
+            new StockpileBasketVaultFactory(wbnb, usdt, ugm, router, fee, oracle);
 
         vm.stopBroadcast();
 
@@ -102,6 +115,7 @@ contract DeployVaultFactory is Script {
         console2.log("  impl:            ", factory.beaconImplementation());
         console2.log("  basketDeployer:  ", factory.basketDeployer());
         console2.log("  slippageOracle:  ", factory.slippageOracle());
+        console2.log("  oracle kind:     ", block.chainid == 56 ? "StockpileSlippageOracle (real TWAP)" : "MockSlippageOracle (testnet stand-in)");
         console2.log("-- constructor inputs --");
         console2.log("  wbnb:            ", wbnb);
         console2.log("  usdt:            ", usdt);
