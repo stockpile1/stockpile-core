@@ -55,7 +55,12 @@ contract LaunchVaultTokenTestnet is Script, VanityHelper {
     address internal constant VAULT_PORTAL = 0x027e3704fC5C16522e9393d04C60A3ac5c0d775f;
     address internal constant PORTAL = 0x5bEacaF7ABCbB3aB280e80D007FD31fcE26510e9; // CREATE2 deployer for clones
     address internal constant TOKEN_IMPL_V3 = 0xE6Ff967a887084c16D0fD71548CF709542cc1557; // testnet V3 impl
-    address internal constant UGM = 0xaA40Da4d2F81207196b16C29A9683ABA9d98Cbd1;
+    /// @dev The UGM this launch wires into. Overridable because the vault reads its UGM from an
+    ///      IMMUTABLE baked in by the factory: if the factory was deployed against a different UGM than the
+    ///      one hardcoded here, this script would allowlist the tax token and approve the adapter on the
+    ///      WRONG contract, and `registerWithGrid()` would then revert "adapter" against the right one.
+    ///      Always pass the same UGM the factory was built with.
+    address internal constant UGM_DEFAULT = 0xaA40Da4d2F81207196b16C29A9683ABA9d98Cbd1;
     address internal constant TWBNB = 0xae13d989daC2f0dEbFf460aC112a837C89BAa7cd;
     uint24 internal constant WBNB_USDT_FEE = 100;
 
@@ -97,7 +102,7 @@ contract LaunchVaultTokenTestnet is Script, VanityHelper {
         require(vault != address(0), "vault not created");
 
         // 3. Allowlist the grid tax token (tWBNB) so setupMarket's createGrid succeeds (deployer = UGM owner).
-        ITestnetUGM(UGM).setAllowedTaxToken(TWBNB, true);
+        ITestnetUGM(_ugm()).setAllowedTaxToken(TWBNB, true);
 
         // 4. setupMarket (deploy basket + create grid) — MEASURE its gas on the live testnet UGM.
         uint256 g0 = gasleft();
@@ -105,7 +110,7 @@ contract LaunchVaultTokenTestnet is Script, VanityHelper {
         uint256 setupGas = g0 - gasleft();
 
         // 5. Bind the grid: guardian-approve the vault as adapter, then the vault binds itself.
-        ITestnetUGM(UGM).setApprovedAdapter(vault, true);
+        ITestnetUGM(_ugm()).setApprovedAdapter(vault, true);
         StockpileBasketVaultV2(payable(vault)).registerWithGrid();
 
         // 6. Fund the vault with native BNB (the Flap fee path). NOTE: distribute() is intentionally NOT
@@ -132,6 +137,12 @@ contract LaunchVaultTokenTestnet is Script, VanityHelper {
 
     // ── Deployment resolution (env or bootstrap) ────────────────────────────────
 
+    /// @dev UGM the factory was built against. MUST match `factory.ugm()`, which is what the vault's
+    ///      immutable points at — see {UGM_DEFAULT}.
+    function _ugm() internal view returns (address) {
+        return vm.envOr("UGM", UGM_DEFAULT);
+    }
+
     function _resolveDeployment() internal {
         factory = vm.envOr("FACTORY", address(0));
         if (factory != address(0)) {
@@ -140,6 +151,17 @@ contract LaunchVaultTokenTestnet is Script, VanityHelper {
             stocks[1] = vm.envAddress("STOCK1");
             stocks[2] = vm.envAddress("STOCK2");
             stocks[3] = vm.envAddress("STOCK3");
+            // The vault reads its UGM from an immutable the FACTORY baked in. If this script wires a
+            // different one, it allowlists the tax token and approves the adapter on the wrong contract and
+            // registerWithGrid() reverts a bare "adapter" much later, with nothing pointing at the cause.
+            // Fail here instead, naming both addresses.
+            address facUgm = StockpileBasketVaultFactory(factory).ugm();
+            require(
+                facUgm == _ugm(),
+                string.concat(
+                    "UGM mismatch: factory.ugm()=", vm.toString(facUgm), " but UGM=", vm.toString(_ugm())
+                )
+            );
             return;
         }
         // Bootstrap: no FACTORY env → deploy a throwaway factory + 4 mock stocks so the dry-run runs
@@ -154,7 +176,7 @@ contract LaunchVaultTokenTestnet is Script, VanityHelper {
         factory =
             address(
             new StockpileBasketVaultFactory(
-                TWBNB, address(usdt), UGM, address(router), WBNB_USDT_FEE, address(new MockSlippageOracle())
+                TWBNB, address(usdt), _ugm(), address(router), WBNB_USDT_FEE, address(new MockSlippageOracle())
             )
         );
     }

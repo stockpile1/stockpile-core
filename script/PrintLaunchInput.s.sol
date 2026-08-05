@@ -29,10 +29,10 @@ import {StockConfig} from "./StockConfig.sol";
 ///         never disagree about which four tokens the basket holds.
 contract PrintLaunchInput is Script {
     // Testnet mocks from the 2026-08-05 deploy; override with STOCK0..STOCK3.
-    address internal constant T_SPCXB = 0xf202974dE703985bC9cAF8D48311C7B90E584363;
-    address internal constant T_NVDAB = 0x7cA3F1BA1BD356aaf6399D75A65a94CBd0A18b59;
-    address internal constant T_AAPLB = 0x750564B2d1107373C325901B4B9351e41ECc467A;
-    address internal constant T_GMEON = 0xEAAAd5e54C766CA21Efee64FCa27597EF0db2963;
+    address internal constant T_SPCXB = 0xF46fa89166ee71D9d9704266DeEE18C958dA6e57;
+    address internal constant T_NVDAB = 0x338cB5799B098f14b5375503A2cf7149d59188AC;
+    address internal constant T_AAPLB = 0xFC72F4bFa7ED7735E893704608eBb477034bFaE4;
+    address internal constant T_GMEON = 0x6787167b8722f6e86a25AF0bc1c7Bc77B362188d;
 
     /// @notice Print the MAINNET basket (the four real stocks in {StockConfig}).
     function run() external view {
