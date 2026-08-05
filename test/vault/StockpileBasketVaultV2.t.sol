@@ -14,6 +14,7 @@ import {MockUGM} from "./mocks/MockUGM.sol";
 import {MockV3Router} from "./mocks/MockV3Router.sol";
 import {MockTaxToken} from "./mocks/MockTaxToken.sol";
 import {MockTriggerService} from "./mocks/MockTriggerService.sol";
+import {MockSlippageOracle} from "./mocks/MockSlippageOracle.sol";
 
 /// @title StockpileBasketVaultV2 unit tests (Flap rules 001-009 conformance)
 /// @notice Runs on chainId 97 (BSC testnet) so VaultBaseV2's chain-fixed `_getVaultPortal()` /
@@ -27,6 +28,7 @@ contract StockpileBasketVaultV2Test is Test {
     MockMintableERC20 internal usdt;
     MockUGM internal ugm;
     MockV3Router internal router;
+    MockSlippageOracle internal oracle;
     MockMintableERC20 internal s0;
     MockMintableERC20 internal s1;
     MockMintableERC20 internal s2;
@@ -43,11 +45,13 @@ contract StockpileBasketVaultV2Test is Test {
         usdt = new MockMintableERC20("USDT", "USDT", 18);
         ugm = new MockUGM();
         router = new MockV3Router();
+        oracle = new MockSlippageOracle(); // floor 0 by default => pre-oracle behaviour
         s0 = new MockMintableERC20("Stock0", "S0", 18);
         s1 = new MockMintableERC20("Stock1", "S1", 18);
         s2 = new MockMintableERC20("Stock2", "S2", 18);
 
-        factory = new StockpileBasketVaultFactory(address(wbnb), address(usdt), address(ugm), address(router), 100);
+        factory =
+            new StockpileBasketVaultFactory(address(wbnb), address(usdt), address(ugm), address(router), 100, address(oracle));
 
         treasury = makeAddr("treasury");
         keeper = makeAddr("keeper");
@@ -268,7 +272,7 @@ contract StockpileBasketVaultV2Test is Test {
         _setupAndRegister(v);
         vm.deal(address(v), 1 ether);
         vm.prank(makeAddr("rando"));
-        vm.expectRevert(bytes(unicode"Not authorized keeper / 未授权的keeper"));
+        vm.expectRevert(bytes(unicode"Not a keeper / 非keeper"));
         v.distribute(_minOut3(), block.timestamp + 1);
     }
 
@@ -306,7 +310,7 @@ contract StockpileBasketVaultV2Test is Test {
         vm.deal(address(v), 1 ether);
         uint256[] memory bad = new uint256[](2);
         vm.prank(GUARDIAN);
-        vm.expectRevert(bytes(unicode"minOut length mismatch / minOut长度不匹配"));
+        vm.expectRevert(bytes(unicode"minOut length / minOut长度错"));
         v.distribute(bad, block.timestamp + 1);
     }
 
@@ -314,7 +318,7 @@ contract StockpileBasketVaultV2Test is Test {
         StockpileBasketVaultV2 v = _newVault(address(new MockTaxToken(100)), 600, 0);
         vm.deal(address(v), 1 ether);
         vm.prank(GUARDIAN);
-        vm.expectRevert(bytes(unicode"Market not set up / 市场未建立"));
+        vm.expectRevert(bytes(unicode"No market / 市场未建立"));
         v.distribute(_minOut3(), block.timestamp + 1);
     }
 
@@ -377,7 +381,7 @@ contract StockpileBasketVaultV2Test is Test {
 
     function testClaimGridPayoutRevertsBeforeSetup() public {
         StockpileBasketVaultV2 v = _newVault(address(new MockTaxToken(100)), 600, 0);
-        vm.expectRevert(bytes(unicode"Market not set up / 市场未建立"));
+        vm.expectRevert(bytes(unicode"No market / 市场未建立"));
         v.claimGridPayout(address(wbnb));
     }
 
@@ -411,6 +415,80 @@ contract StockpileBasketVaultV2Test is Test {
         uint256 minted2 = v.distribute(_minOut3(), block.timestamp + 1);
         assertGt(minted2, 0, "retry succeeds in the same block");
         assertEq(v.lastDistribute(), block.timestamp, "gate advances only on a productive round");
+    }
+
+    // ── AUDIT v9 Finding 2: swaps carry an on-chain slippage floor ──────────────
+
+    /// @dev The trigger path passes no caller `minOut`, so without the oracle it would swap unbounded.
+    ///      With a floor the router cannot meet, the leg must SKIP (and say so) rather than execute.
+    function testOracleFloorSkipsLegItCannotMeet() public {
+        StockpileBasketVaultV2 v = _newVault(address(new MockTaxToken(100)), 1000, 0);
+        _setupAndRegister(v);
+        vm.deal(address(v), 10 ether);
+
+        // The 1:1 mock router can never return more than the input, so this floor is unreachable.
+        oracle.setFloor(address(s1), type(uint128).max);
+
+        vm.prank(GUARDIAN);
+        v.distribute(_minOut3(), block.timestamp + 1);
+
+        // Legs 0 and 2 landed; leg 1 was priced out and skipped — its WBNB is retained, not spent.
+        StockBasket b = StockBasket(v.basket());
+        assertGt(s0.balanceOf(address(b)), 0, "leg 0 executed");
+        assertEq(s1.balanceOf(address(b)), 0, "leg 1 skipped by the floor");
+        assertGt(s2.balanceOf(address(b)), 0, "leg 2 executed");
+        assertGt(v.pendingDistribute(), 0, "skipped leg's WBNB retained for the next round");
+    }
+
+    /// @dev FAIL-CLOSED: an unusable oracle must skip the leg, never fall back to a zero floor.
+    function testOracleFailureSkipsRatherThanSwappingUnbounded() public {
+        StockpileBasketVaultV2 v = _newVault(address(new MockTaxToken(100)), 1000, 0);
+        _setupAndRegister(v);
+        vm.deal(address(v), 10 ether);
+
+        oracle.setRevert(true); // every quote reverts (missing pool / window too young)
+
+        vm.prank(GUARDIAN);
+        vm.expectRevert(); // the SHARED hop-1 quote is systemic, so the round cannot proceed at all
+        v.distribute(_minOut3(), block.timestamp + 1);
+
+        assertEq(v.pendingDistribute(), 10 ether, "nothing was swapped");
+    }
+
+    /// @dev The caller's floor may only ever TIGHTEN the oracle's, never loosen it.
+    function testCallerFloorCannotLoosenOracleFloor() public {
+        StockpileBasketVaultV2 v = _newVault(address(new MockTaxToken(100)), 1000, 0);
+        _setupAndRegister(v);
+        vm.deal(address(v), 10 ether);
+
+        oracle.setFloor(address(s1), type(uint128).max);
+
+        // Caller explicitly asks for zero protection on every leg — the oracle floor still binds.
+        vm.prank(GUARDIAN);
+        v.distributeUniform(0, block.timestamp + 1);
+
+        assertEq(s1.balanceOf(address(StockBasket(v.basket()))), 0, "oracle floor survived a zero caller floor");
+    }
+
+    function testSetMaxSlippageBpsGuardianOnlyAndBounded() public {
+        StockpileBasketVaultV2 v = _newVault(address(new MockTaxToken(100)), 600, 0);
+        assertEq(v.maxSlippageBps(), 300, "seeded to the 3% default at init");
+
+        vm.prank(makeAddr("rando"));
+        vm.expectRevert(bytes(unicode"Only Guardian / 仅限 Guardian"));
+        v.setMaxSlippageBps(500);
+
+        vm.prank(GUARDIAN);
+        vm.expectRevert(bytes(unicode"Bad slippage bps / 滑点参数无效"));
+        v.setMaxSlippageBps(0); // would disable the floor entirely
+
+        vm.prank(GUARDIAN);
+        vm.expectRevert(bytes(unicode"Bad slippage bps / 滑点参数无效"));
+        v.setMaxSlippageBps(1001); // above MAX_SLIPPAGE_BPS
+
+        vm.prank(GUARDIAN);
+        v.setMaxSlippageBps(500);
+        assertEq(v.maxSlippageBps(), 500, "retuned");
     }
 
     // ── Guardian rescue: receive() forward switch (SYS-REQ-RESCUE-MECHANISM) ────
@@ -536,7 +614,7 @@ contract StockpileBasketVaultV2Test is Test {
         counts[0] = 2;
         counts[1] = 3;
         counts[2] = 4;
-        counts[3] = 5;
+        counts[3] = 4;
 
         for (uint256 k = 0; k < counts.length; k++) {
             MockTriggerService ts = _installTriggerService();
@@ -642,7 +720,7 @@ contract StockpileBasketVaultV2Test is Test {
         StockpileBasketVaultV2 v = _newVault(address(new MockTaxToken(100)), 600, 0);
         _setupAndRegister(v);
         // No BNB on the vault at all.
-        vm.expectRevert(bytes(unicode"Insufficient BNB for trigger fee / BNB不足以支付触发费"));
+        vm.expectRevert(bytes(unicode"BNB too low for fee / BNB不足付费"));
         v.scheduleDistribute();
     }
 
@@ -650,7 +728,7 @@ contract StockpileBasketVaultV2Test is Test {
         _installTriggerService();
         StockpileBasketVaultV2 v = _newVault(address(new MockTaxToken(100)), 600, 0);
         vm.deal(address(v), 1 ether);
-        vm.expectRevert(bytes(unicode"Market not set up / 市场未建立"));
+        vm.expectRevert(bytes(unicode"No market / 市场未建立"));
         v.scheduleDistribute();
     }
 
@@ -910,7 +988,7 @@ contract StockpileBasketVaultV2Test is Test {
         _setupAndRegister(v);
         vm.deal(address(v), 1 ether);
         vm.prank(makeAddr("rando"));
-        vm.expectRevert(bytes(unicode"Not authorized keeper / 未授权的keeper"));
+        vm.expectRevert(bytes(unicode"Not a keeper / 非keeper"));
         v.distributeUniform(0, block.timestamp + 1);
     }
 
@@ -1133,7 +1211,7 @@ contract StockpileBasketVaultV2Test is Test {
 
     function testRegisterWithGridBeforeSetupReverts() public {
         StockpileBasketVaultV2 v = _newVault(address(new MockTaxToken(100)), 600, 0);
-        vm.expectRevert(bytes(unicode"Market not set up / 市场未建立"));
+        vm.expectRevert(bytes(unicode"No market / 市场未建立"));
         v.registerWithGrid();
     }
 
@@ -1141,7 +1219,7 @@ contract StockpileBasketVaultV2Test is Test {
         StockpileBasketVaultV2 v = _newVault(address(new MockTaxToken(100)), 600, 0);
         vm.prank(makeAddr("rando"));
         vm.expectRevert(bytes(unicode"Only self / 仅限自身"));
-        v.swapLeg(0, 1, 0, block.timestamp + 1);
+        v.swapLeg(0, 1, 0, 0, block.timestamp + 1);
     }
 
     /// @dev {approveStock} exists only so {_depositToBasket} can isolate a per-leg approval (M-05). It must

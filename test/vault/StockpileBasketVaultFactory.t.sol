@@ -14,6 +14,7 @@ import {MockWBNB} from "./mocks/MockWBNB.sol";
 import {MockMintableERC20} from "./mocks/MockMintableERC20.sol";
 import {MockUGM} from "./mocks/MockUGM.sol";
 import {MockV3Router} from "./mocks/MockV3Router.sol";
+import {MockSlippageOracle} from "./mocks/MockSlippageOracle.sol";
 import {MockTaxToken} from "./mocks/MockTaxToken.sol";
 
 /// @title StockpileBasketVaultFactory unit tests (Rule 002 / 006 conformance)
@@ -25,6 +26,7 @@ contract StockpileBasketVaultFactoryTest is Test {
     MockMintableERC20 internal usdt;
     MockUGM internal ugm;
     MockV3Router internal router;
+    MockSlippageOracle internal oracle;
     MockMintableERC20 internal s0;
     MockMintableERC20 internal s1;
 
@@ -39,7 +41,10 @@ contract StockpileBasketVaultFactoryTest is Test {
         router = new MockV3Router();
         s0 = new MockMintableERC20("Stock0", "S0", 18);
         s1 = new MockMintableERC20("Stock1", "S1", 18);
-        factory = new StockpileBasketVaultFactory(address(wbnb), address(usdt), address(ugm), address(router), 100);
+        oracle = new MockSlippageOracle();
+        factory = new StockpileBasketVaultFactory(
+            address(wbnb), address(usdt), address(ugm), address(router), 100, address(oracle)
+        );
         treasury = makeAddr("treasury");
     }
 
@@ -277,7 +282,9 @@ contract StockpileBasketVaultFactoryTest is Test {
 
     function testUpgradeVaultImplementationGuardianOnly() public {
         StockpileBasketVaultV2 newImpl =
-            new StockpileBasketVaultV2(address(wbnb), address(usdt), address(ugm), address(router), 100, factory.basketDeployer());
+            new StockpileBasketVaultV2(
+                address(wbnb), address(usdt), address(ugm), address(router), 100, factory.basketDeployer(), address(oracle)
+            );
 
         vm.prank(makeAddr("rando"));
         vm.expectRevert(bytes(unicode"Only Guardian / 仅限 Guardian"));
@@ -299,7 +306,9 @@ contract StockpileBasketVaultFactoryTest is Test {
 
         // After lock, even the Guardian can no longer upgrade (beacon ownership renounced).
         StockpileBasketVaultV2 newImpl =
-            new StockpileBasketVaultV2(address(wbnb), address(usdt), address(ugm), address(router), 100, factory.basketDeployer());
+            new StockpileBasketVaultV2(
+                address(wbnb), address(usdt), address(ugm), address(router), 100, factory.basketDeployer(), address(oracle)
+            );
         vm.prank(GUARDIAN);
         vm.expectRevert();
         factory.upgradeVaultImplementation(address(newImpl));

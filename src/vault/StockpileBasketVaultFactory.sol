@@ -64,6 +64,9 @@ contract StockpileBasketVaultFactory is VaultFactoryBaseV2 {
     uint24 public immutable wbnbUsdtFee;
     /// @notice Shared {StockBasketDeployer} the impl uses to deploy each vault's basket (EIP-170 headroom).
     address public immutable basketDeployer;
+    /// @notice The TWAP slippage oracle every vault from this factory consults (see
+    ///         {StockpileSlippageOracle}). Immutable, so the floor's price source can never be repointed.
+    address public immutable slippageOracle;
 
     // ── Registry ────────────────────────────────────────────────────────────────
 
@@ -83,9 +86,10 @@ contract StockpileBasketVaultFactory is VaultFactoryBaseV2 {
     /// @param _ugm         Stockpile UnifiedGridManager address.
     /// @param _router      PancakeSwap V3 SwapRouter address.
     /// @param _fee         WBNB→USDT first-hop fee tier (e.g. 100).
-    constructor(address _wbnb, address _usdt, address _ugm, address _router, uint24 _fee) {
+    constructor(address _wbnb, address _usdt, address _ugm, address _router, uint24 _fee, address _slippageOracle) {
         require(
-            _wbnb != address(0) && _usdt != address(0) && _ugm != address(0) && _router != address(0),
+            _wbnb != address(0) && _usdt != address(0) && _ugm != address(0) && _router != address(0)
+                && _slippageOracle != address(0),
             unicode"Zero address / 零地址"
         );
         // The UGM must be a live contract; a codeless address would brick every vault's setupMarket/distribute.
@@ -96,11 +100,13 @@ contract StockpileBasketVaultFactory is VaultFactoryBaseV2 {
         ugm = _ugm;
         swapRouter = _router;
         wbnbUsdtFee = _fee;
+        slippageOracle = _slippageOracle;
 
         address dep = address(new StockBasketDeployer());
         basketDeployer = dep;
 
-        StockpileBasketVaultV2 impl = new StockpileBasketVaultV2(_wbnb, _usdt, _ugm, _router, _fee, dep);
+        StockpileBasketVaultV2 impl =
+            new StockpileBasketVaultV2(_wbnb, _usdt, _ugm, _router, _fee, dep, _slippageOracle);
         beacon = address(new UpgradeableBeacon(address(impl)));
     }
 

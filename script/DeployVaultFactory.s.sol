@@ -7,6 +7,8 @@ import {StockpileBasketVaultFactory} from "../src/vault/StockpileBasketVaultFact
 import {MockMintableERC20} from "../test/vault/mocks/MockMintableERC20.sol";
 import {MockV3Router} from "../test/vault/mocks/MockV3Router.sol";
 import {StockConfig} from "./StockConfig.sol";
+import {StockpileSlippageOracle} from "../src/vault/StockpileSlippageOracle.sol";
+import {BscAddresses} from "../src/config/BscAddresses.sol";
 
 /// @title DeployVaultFactory — deploy the Flap vault-backed {StockpileBasketVaultFactory}
 ///
@@ -81,7 +83,14 @@ contract DeployVaultFactory is Script {
             revert("unsupported chain: run on 56 or 97, or set WBNB/USDT/UGM/ROUTER explicitly");
         }
 
-        StockpileBasketVaultFactory factory = new StockpileBasketVaultFactory(wbnb, usdt, ugm, router, fee);
+        // The TWAP slippage oracle every vault consults (AUDIT v9 Finding 2). It reads PancakeSwap V3
+        // pools directly, so it is wired to the real V3 factory on both chains; on testnet the mock
+        // router means its quotes are unused in a dry run, but the wiring stays identical to mainnet.
+        StockpileSlippageOracle oracle =
+            new StockpileSlippageOracle(BscAddresses.PANCAKE_V3_FACTORY, wbnb, usdt, fee);
+
+        StockpileBasketVaultFactory factory =
+            new StockpileBasketVaultFactory(wbnb, usdt, ugm, router, fee, address(oracle));
 
         vm.stopBroadcast();
 
@@ -92,6 +101,7 @@ contract DeployVaultFactory is Script {
         console2.log("  beacon:          ", factory.beacon());
         console2.log("  impl:            ", factory.beaconImplementation());
         console2.log("  basketDeployer:  ", factory.basketDeployer());
+        console2.log("  slippageOracle:  ", factory.slippageOracle());
         console2.log("-- constructor inputs --");
         console2.log("  wbnb:            ", wbnb);
         console2.log("  usdt:            ", usdt);

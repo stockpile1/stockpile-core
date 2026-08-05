@@ -661,6 +661,100 @@ contract StockBasketTest is Test {
         assertGt(b.previewRedeem(b.balanceOf(ALICE))[0], aliceClaimBefore, "prior holder not diluted");
     }
 
+    // ── AUDIT v9 Finding 3: a failed redeem leg is DEFERRED, never forfeited ────
+
+    /// @dev A redeemer whose payout leg reverts keeps a claim on that slice: it is booked in `unpaid`,
+    ///      removed from the pro-rata base so nobody else can be paid the same tokens, and collectable
+    ///      once the stock is healthy again. Previously the slice was lost and accreted to the others.
+    function test_Redeem_FailedLeg_IsDeferredNotForfeited() public {
+        MockPausableStock ps = new MockPausableStock("Paused", "PS", 18);
+        address[] memory stx = new address[](2);
+        stx[0] = address(s0);
+        stx[1] = address(ps);
+        StockBasket b = new StockBasket("BE", "BE", stx);
+        b.setVault(address(this));
+
+        s0.approve(address(b), type(uint256).max);
+        ps.mint(address(this), 1e30);
+        ps.approve(address(b), type(uint256).max);
+
+        uint256[] memory amts = new uint256[](2);
+        amts[0] = 100e18;
+        amts[1] = 100e18;
+        b.deposit(amts, _legValues(amts, 1000e18), ALICE);
+
+        ps.setPaused(true); // the paused stock's transfer now reverts
+
+        vm.prank(ALICE);
+        uint256[] memory got = b.redeem(500e18, ALICE);
+
+        assertGt(got[0], 0, "healthy leg delivered");
+        assertEq(got[1], 0, "paused leg not delivered");
+        // The slice is OWED, not gone.
+        uint256 owed = b.unpaid(address(ps), ALICE);
+        assertEq(owed, 50e18, "half the paused reserve booked to ALICE");
+        assertEq(b.totalDeferred(address(ps)), owed, "tracked globally too");
+        // And it is excluded from what remains claimable.
+        assertEq(b.reserves()[1], 100e18 - owed, "deferred slice removed from the pro-rata base");
+
+        // Once healthy, ALICE collects it.
+        ps.setPaused(false);
+        vm.prank(ALICE);
+        uint256 claimed = b.claimUnpaid(address(ps), ALICE);
+        assertEq(claimed, owed, "collected the deferred slice");
+        assertEq(ps.balanceOf(ALICE), owed, "ALICE actually received it");
+        assertEq(b.unpaid(address(ps), ALICE), 0, "credit consumed");
+        assertEq(b.totalDeferred(address(ps)), 0, "global tally cleared");
+    }
+
+    /// @dev The deferred slice must not be payable twice: a later redeemer of the REMAINING shares can
+    ///      only ever receive the non-deferred portion.
+    function test_Redeem_DeferredSlice_NotPaidTwice() public {
+        MockPausableStock ps = new MockPausableStock("Paused", "PS", 18);
+        address[] memory stx = new address[](2);
+        stx[0] = address(s0);
+        stx[1] = address(ps);
+        StockBasket b = new StockBasket("BE", "BE", stx);
+        b.setVault(address(this));
+
+        s0.approve(address(b), type(uint256).max);
+        ps.mint(address(this), 1e30);
+        ps.approve(address(b), type(uint256).max);
+
+        uint256[] memory amts = new uint256[](2);
+        amts[0] = 100e18;
+        amts[1] = 100e18;
+        b.deposit(amts, _legValues(amts, 1000e18), ALICE);
+        vm.prank(ALICE);
+        b.transfer(BOB, 500e18); // ALICE and BOB hold half each
+
+        ps.setPaused(true);
+        vm.prank(ALICE);
+        b.redeem(500e18, ALICE); // ALICE's paused slice (50e18) is deferred
+        ps.setPaused(false);
+
+        // BOB redeems the rest: he may only take the NON-deferred remainder, not ALICE's booked slice.
+        vm.prank(BOB);
+        uint256[] memory gotBob = b.redeem(500e18, BOB);
+        assertEq(gotBob[1], 50e18, "BOB gets only the undeferred half");
+        assertEq(ps.balanceOf(address(b)), 50e18, "ALICE's booked slice still held by the basket");
+
+        // ALICE can still collect hers afterwards.
+        vm.prank(ALICE);
+        assertEq(b.claimUnpaid(address(ps), ALICE), 50e18, "ALICE's claim survived BOB's redemption");
+        assertEq(ps.balanceOf(address(b)), 0, "basket fully drained, nothing lost");
+    }
+
+    function test_ClaimUnpaid_RevertsWhenNothingOwed() public {
+        vm.expectRevert(bytes(unicode"Nothing owed / 无欠款"));
+        basket.claimUnpaid(address(s0), ALICE);
+    }
+
+    function test_ClaimUnpaid_RevertsOnZeroRecipient() public {
+        vm.expectRevert(bytes(unicode"Zero address / 零地址"));
+        basket.claimUnpaid(address(s0), address(0));
+    }
+
     // ── S7: renounceOwnership is disabled ───────────────────────────────────────
 
     function test_RenounceOwnership_Disabled() public {

@@ -58,6 +58,18 @@ contract StockBasket is ERC20, ReentrancyGuard, Ownable {
     ///         construction, via {setVault} — see the deploy-order note there. Zero until set.
     address public vault;
 
+    /// @notice stock => recipient => amount owed from a {redeem} payout leg that reverted.
+    /// @dev    A redeemer's shares are burned atomically for the whole basket, so a leg whose transfer
+    ///         fails cannot be "un-burned". Instead of forfeiting that slice, it is booked here and the
+    ///         recipient pulls it later via {claimUnpaid} once the stock is healthy again.
+    mapping(address => mapping(address => uint256)) public unpaid;
+
+    /// @notice stock => total amount booked in {unpaid} across all recipients.
+    /// @dev    Deferred slices are already spoken for, so they are EXCLUDED from the pro-rata base used by
+    ///         {redeem} / {previewRedeem} / {reserves}. Without this they would be counted as free reserve
+    ///         and paid out twice — once to the deferred claimant and again to later redeemers.
+    mapping(address => uint256) public totalDeferred;
+
     // ── Events ───────────────────────────────────────────────────────────────
 
     /// @notice Emitted once at construction with the frozen list of underlying stocks.
@@ -71,6 +83,10 @@ contract StockBasket is ERC20, ReentrancyGuard, Ownable {
     event PullSkipped(uint256 indexed legIndex, address indexed stock, uint256 amount, uint256 legValue);
     /// @notice Emitted on each {redeem}: the shares burned and the pro-rata stock amounts paid out.
     event Redeemed(address indexed from, address indexed to, uint256 shares, uint256[] amounts);
+    /// @notice Emitted when a {redeem} payout leg reverts and its slice is booked for later collection.
+    event PayoutDeferred(address indexed stock, address indexed to, uint256 amount);
+    /// @notice Emitted when a previously deferred slice is collected via {claimUnpaid}.
+    event UnpaidClaimed(address indexed stock, address indexed owner, address indexed to, uint256 amount);
 
     // ── Modifiers ────────────────────────────────────────────────────────────
 
@@ -212,10 +228,12 @@ contract StockBasket is ERC20, ReentrancyGuard, Ownable {
     ///
     ///         BEST-EFFORT PER STOCK (S3): each payout is made through the self-gated {_payout} helper in
     ///         its own try/catch, so a SINGLE paused / blacklisting stock is SKIPPED instead of bricking
-    ///         the whole redemption — the other stocks still deliver. TRADEOFF: a skipped stock's slice is
-    ///         FORFEITED by this redeemer (the shares are already burned) and stays in the basket,
-    ///         benefiting the remaining holders. The returned `amounts` reflect what was ACTUALLY paid (a
-    ///         skipped leg is zeroed).
+    ///         the whole redemption — the other stocks still deliver. A deferred stock's slice is NOT
+    ///         forfeited (AUDIT v9 Finding 3): the shares are burned atomically for the whole basket and
+    ///         cannot be un-burned for one leg, so the slice is credited to `to` in {unpaid} and collected
+    ///         later via {claimUnpaid}. It is excluded from the pro-rata base by {totalDeferred} so it is
+    ///         never paid out twice. The returned `amounts` reflect what was ACTUALLY paid (a deferred leg
+    ///         is zeroed).
     /// @param  shares Amount of basket shares to redeem (must be > 0; caller must hold at least this many,
     ///                enforced by `_burn`).
     /// @param  to     Recipient of the redeemed stocks (non-zero).
@@ -230,8 +248,7 @@ contract StockBasket is ERC20, ReentrancyGuard, Ownable {
 
         // ── Compute every payout from PRE-burn balances (CEI: interactions come last). ──
         for (uint256 i = 0; i < n; i++) {
-            uint256 bal = IERC20(stocks[i]).balanceOf(address(this));
-            amounts[i] = (shares * bal) / supply;
+            amounts[i] = (shares * _available(stocks[i])) / supply;
         }
 
         // ── Effects: burn before any external transfer (also enforces caller's balance). ──
@@ -241,17 +258,49 @@ contract StockBasket is ERC20, ReentrancyGuard, Ownable {
         for (uint256 i = 0; i < n; i++) {
             if (amounts[i] > 0) {
                 // Isolate each stock's transfer in its own external self-call so one reverting stock
-                // (paused / blacklisting) is caught and SKIPPED — its slice stays in the basket (forfeit)
-                // — while the remaining stocks still deliver. `amounts[i]` is zeroed so the return value
-                // reflects what was actually paid.
+                // (paused / blacklisting) is caught and SKIPPED — the remaining stocks still deliver.
                 try this._payout(stocks[i], to, amounts[i]) {}
                 catch {
-                    amounts[i] = 0;
+                    // The slice is BOOKED, not forfeited (AUDIT v9 Finding 3). The shares are already
+                    // burned and cannot be un-burned for one leg, so instead of letting the slice accrete
+                    // to the remaining holders it is credited to `to`, who collects it via {claimUnpaid}
+                    // once the stock is healthy. It is also removed from the pro-rata base by
+                    // {totalDeferred} so later redeemers cannot be paid the same tokens.
+                    unpaid[stocks[i]][to] += amounts[i];
+                    totalDeferred[stocks[i]] += amounts[i];
+                    emit PayoutDeferred(stocks[i], to, amounts[i]);
+                    amounts[i] = 0; // the return value reflects what was ACTUALLY paid
                 }
             }
         }
 
         emit Redeemed(msg.sender, to, shares, amounts);
+    }
+
+    /// @notice Collect a slice that a previous {redeem} could not deliver because the stock's transfer
+    ///         reverted at the time (paused / blacklisting).
+    /// @dev    Permissionless for the credited owner; `to` lets a since-blacklisted holder redirect the
+    ///         payout. NOT best-effort: if the stock still refuses the transfer this reverts and the
+    ///         credit is preserved for a later attempt.
+    /// @param  stock The underlying stock to collect.
+    /// @param  to    Recipient of the collected tokens (non-zero).
+    /// @return amount The amount transferred.
+    function claimUnpaid(address stock, address to) external nonReentrant returns (uint256 amount) {
+        require(to != address(0), unicode"Zero address / 零地址");
+        amount = unpaid[stock][msg.sender];
+        require(amount > 0, unicode"Nothing owed / 无欠款");
+
+        unpaid[stock][msg.sender] = 0;
+        totalDeferred[stock] -= amount;
+
+        IERC20(stock).safeTransfer(to, amount);
+        emit UnpaidClaimed(stock, msg.sender, to, amount);
+    }
+
+    /// @dev The portion of `stock` the basket holds that is NOT already owed to a deferred claimant, i.e.
+    ///      the base every pro-rata calculation must use.
+    function _available(address stock) internal view returns (uint256) {
+        return IERC20(stock).balanceOf(address(this)) - totalDeferred[stock];
     }
 
     /// @notice Self-gated payout helper for {redeem}'s best-effort per-stock delivery: transfers `amount`
@@ -280,17 +329,19 @@ contract StockBasket is ERC20, ReentrancyGuard, Ownable {
         amounts = new uint256[](n);
         if (supply == 0) return amounts; // no shares exist ⇒ nothing to redeem
         for (uint256 i = 0; i < n; i++) {
-            amounts[i] = (shares * IERC20(stocks[i]).balanceOf(address(this))) / supply;
+            amounts[i] = (shares * _available(stocks[i])) / supply;
         }
     }
 
-    /// @notice The basket's current balance of each underlying stock (the live reserves).
-    /// @return bals Per-stock balance, positionally paired with {stocks}.
+    /// @notice The basket's CLAIMABLE reserve of each underlying stock: its balance minus anything already
+    ///         booked in {unpaid} for a deferred claimant. Equals the raw balance whenever nothing is
+    ///         deferred, which is the normal case.
+    /// @return bals Per-stock claimable reserve, positionally paired with {stocks}.
     function reserves() external view returns (uint256[] memory bals) {
         uint256 n = stocks.length;
         bals = new uint256[](n);
         for (uint256 i = 0; i < n; i++) {
-            bals[i] = IERC20(stocks[i]).balanceOf(address(this));
+            bals[i] = _available(stocks[i]);
         }
     }
 

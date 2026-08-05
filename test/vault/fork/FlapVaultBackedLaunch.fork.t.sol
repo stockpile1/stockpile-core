@@ -10,6 +10,7 @@ import {StockpileBasketVaultFactory, VaultDataV1} from "../../../src/vault/Stock
 import {StockpileBasketVaultV2} from "../../../src/vault/StockpileBasketVaultV2.sol";
 import {StockBasket} from "../../../src/vault/StockBasket.sol";
 import {MockUGM} from "../mocks/MockUGM.sol";
+import {StockpileSlippageOracle} from "../../../src/vault/StockpileSlippageOracle.sol";
 
 /// @title FlapVaultBackedLaunch — TRUE Flap vault-backed launch, end-to-end on a BSC-mainnet fork
 ///
@@ -20,17 +21,17 @@ import {MockUGM} from "../mocks/MockUGM.sol";
 ///      {StockBasketDeployer} + vault impl + beacon in its constructor).
 ///   2. Launch a real 7777-vanity Flap V3 tax token through the REAL mainnet Flap
 ///      `VaultPortal.newTokenV6WithVault` (native-BNB quote, factory = ours, vaultData = a valid
-///      VaultDataV1 with 3 real stocks). The VaultPortal calls our `factory.newVault(...)`, which
+///      VaultDataV1 with the 4 production stocks). The VaultPortal calls our `factory.newVault(...)`, which
 ///      deploys + initializes the per-token BeaconProxy vault. We assert the vault exists both via
 ///      `VaultPortal.getVault(token).vault` and `factory.vaultOf(token)`, and that init wired the config.
-///   3. `vault.setupMarket()` deploys the vault's OWN {StockBasket} (over the 3 real stocks) + creates its
-///      OWN grid on the sink; assert basket.getStocks() == the 3 stocks and gridId != 0.
+///   3. `vault.setupMarket()` deploys the vault's OWN {StockBasket} (over the 4 production stocks) + creates its
+///      OWN grid on the sink; assert basket.getStocks() == the 4 stocks and gridId != 0.
 ///   4. Wire the sink: `ugm.setApprovedAdapter(vault, true)` + `vault.registerWithGrid()`.
 ///   5. Fund the vault with native BNB (the Flap fee path), then — pranking as the mainnet Flap Guardian
 ///      (`_getGuardian()`) — call `vault.distributeUniform(0, deadline)`: assert the commission is skimmed
-///      to the treasury, the real WBNB→USDT→stock swaps executed (basket physically holds all 3 stocks),
+///      to the treasury, the real WBNB→USDT→stock swaps executed (basket physically holds all 4 stocks),
 ///      basket shares were minted, and the grid was fed (`MockUGM.yieldByAsset(assetHash) > 0`).
-///   6. A holder redeems basket shares → receives a pro-rata slice of ALL 3 real stocks.
+///   6. A holder redeems basket shares → receives a pro-rata slice of ALL 4 real stocks.
 ///
 ///         Run (public RPC may 429 — the TEST itself is the proof):
 ///           BSC_RPC_URL=https://bsc-dataseed.bnbchain.org \
@@ -41,12 +42,15 @@ contract FlapVaultBackedLaunchForkTest is FlapBSCFixture {
     address internal constant WBNB = 0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c;
     address internal constant USDT = 0x55d398326f99059fF775485246999027B3197955;
     address internal constant PANCAKE_V3_ROUTER = 0x1b81D678ffb9C0263b24A97847620C99d213eB14;
+    address internal constant PANCAKE_V3_FACTORY = 0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865;
     uint24 internal constant WBNB_USDT_FEE = 100;
 
-    // 3 real "stock" tokens with their live USDT→stock V3 fee tiers (from RefVaultRoute.fork.t.sol).
+    // The 4 PRODUCTION stocks with their live USDT→stock V3 fee tiers — kept identical to
+    // {StockConfig} so this fork run measures the real basket, gas included.
     address internal constant SPCXB = 0xbe9D156892E55e7154BcD3cB0FEA677F9D3103E1;
-    address internal constant QQQB = 0x205812CdBed920aFf76C6580abD681a46D11efc7;
     address internal constant NVDAB = 0x02Fca66C1D1aFB4E2A7884261eB00F63598a7436;
+    address internal constant AAPLB = 0x431a3BEE82E2ca41e49895CbECE5bB0F76A89b7A;
+    address internal constant GMEON = 0xdABb9afF4cf02f26D2014e4cA9f94aC6fe6572a3;
 
     // ── Vault config (a valid VaultDataV1) ──────────────────────────────────────
     uint16 internal constant GRID_SIZE = 100;
@@ -58,6 +62,7 @@ contract FlapVaultBackedLaunchForkTest is FlapBSCFixture {
 
     MockUGM internal ugm;
     StockpileBasketVaultFactory internal factory;
+    StockpileSlippageOracle internal oracle;
     address internal treasury = makeAddr("treasury");
     address internal launcher = makeAddr("launcher");
 
@@ -65,7 +70,11 @@ contract FlapVaultBackedLaunchForkTest is FlapBSCFixture {
         _forkBSCMainnet(); // chainid becomes 56 ⇒ _getVaultPortal()/_getGuardian() resolve to mainnet
         ugm = new MockUGM();
         // 5-arg constructor: self-deploys StockBasketDeployer + vault impl + UpgradeableBeacon.
-        factory = new StockpileBasketVaultFactory(WBNB, USDT, address(ugm), PANCAKE_V3_ROUTER, WBNB_USDT_FEE);
+        // The REAL oracle against live PancakeSwap V3 pools — this fork run is what validates its maths.
+        oracle = new StockpileSlippageOracle(PANCAKE_V3_FACTORY, WBNB, USDT, WBNB_USDT_FEE);
+        factory = new StockpileBasketVaultFactory(
+            WBNB, USDT, address(ugm), PANCAKE_V3_ROUTER, WBNB_USDT_FEE, address(oracle)
+        );
 
         vm.label(address(factory), "StockpileBasketVaultFactory");
         vm.label(address(ugm), "MockUGM(sink)");
@@ -77,22 +86,25 @@ contract FlapVaultBackedLaunchForkTest is FlapBSCFixture {
     // ── vaultData builder (the exact Rule-002 schema tuple) ─────────────────────
 
     function _stocks() internal pure returns (address[] memory s) {
-        s = new address[](3);
+        s = new address[](4);
         s[0] = SPCXB;
-        s[1] = QQQB;
-        s[2] = NVDAB;
+        s[1] = NVDAB;
+        s[2] = AAPLB;
+        s[3] = GMEON;
     }
 
     function _vaultData() internal view returns (bytes memory) {
         address[] memory stocks = _stocks();
-        uint24[] memory fees = new uint24[](3);
+        uint24[] memory fees = new uint24[](4);
         fees[0] = 2500;
-        fees[1] = 100;
+        fees[1] = 2500;
         fees[2] = 2500;
-        uint16[] memory weights = new uint16[](3);
-        weights[0] = 3400;
-        weights[1] = 3300;
-        weights[2] = 3300; // sums to 10_000
+        fees[3] = 2500;
+        uint16[] memory weights = new uint16[](4);
+        weights[0] = 2500;
+        weights[1] = 2500;
+        weights[2] = 2500;
+        weights[3] = 2500; // sums to 10_000
         VaultDataV1 memory d = VaultDataV1({
             gridSize: GRID_SIZE,
             gridTaxRateBps: GRID_TAX_BPS,
@@ -164,14 +176,15 @@ contract FlapVaultBackedLaunchForkTest is FlapBSCFixture {
         address basketAddr = vault.basket();
         assertTrue(basketAddr != address(0), "basket deployed");
         assertTrue(vault.gridId() != 0, "grid created");
-        assertEq(vault.stocksLength(), 3, "3 stock legs decoded");
+        assertEq(vault.stocksLength(), 4, "4 stock legs decoded");
 
         StockBasket basket = StockBasket(basketAddr);
         address[] memory bs = basket.getStocks();
-        assertEq(bs.length, 3, "basket has 3 stocks");
+        assertEq(bs.length, 4, "basket has 4 stocks");
         assertEq(bs[0], SPCXB, "basket stock 0 == SPCXB");
-        assertEq(bs[1], QQQB, "basket stock 1 == QQQB");
-        assertEq(bs[2], NVDAB, "basket stock 2 == NVDAB");
+        assertEq(bs[1], NVDAB, "basket stock 1 == NVDAB");
+        assertEq(bs[2], AAPLB, "basket stock 2 == AAPLB");
+        assertEq(bs[3], GMEON, "basket stock 3 == GMEon");
         assertEq(basket.vault(), vaultAddr, "vault is the basket's sole minter");
 
         // ── 4. Wire the sink: guardian approves the vault as adapter, vault binds itself. ──
@@ -194,9 +207,9 @@ contract FlapVaultBackedLaunchForkTest is FlapBSCFixture {
         // Rule 008 §4: the Flap Trigger Service hard-caps every callback at 2,000,000 gas. This is the
         // REAL cost against live PancakeSwap V3 pools (the unit tests' mock router is far cheaper), so it
         // is the number that decides how many stock legs can run in one triggered distribute.
-        emit log_named_uint("REAL distribute gas (3 legs, live V3)", distributeGas);
-        emit log_named_uint("REAL gas per stock leg (approx)", distributeGas / 3);
-        assertLt(distributeGas, 2_000_000, "3-leg distribute must fit the Trigger Service 2M callback cap");
+        emit log_named_uint("REAL distribute gas (4 legs, live V3, with oracle)", distributeGas);
+        emit log_named_uint("REAL gas per stock leg (approx)", distributeGas / 4);
+        assertLt(distributeGas, 2_000_000, "4-leg distribute must fit the Trigger Service 2M callback cap");
 
         // Commission skimmed to treasury in WBNB (>0, never above the 6% cap on the gross).
         uint256 commission = IERC20(WBNB).balanceOf(treasury);
@@ -208,16 +221,34 @@ contract FlapVaultBackedLaunchForkTest is FlapBSCFixture {
         assertGt(basketMinted, 0, "basket shares minted");
         assertEq(basket.totalSupply(), basketMinted, "supply == minted");
 
-        // Real WBNB→USDT→stock swaps happened: the basket physically holds all 3 stocks.
+        // ── Oracle sanity: the TWAP maths must agree with what the pools actually paid. ──
+        //
+        // This is the check that validates StockpileSlippageOracle's hand-transcribed TickMath /
+        // FullMath against live pools. A transcription error would not revert — it would silently quote
+        // an absurd price, making the floor either unreachable (every leg skips) or meaningless (a floor
+        // near zero). Bounding realized-vs-quoted on BOTH sides catches either failure.
+        {
+            uint256 legIn = ((FUND - commission) * 2500) / 10_000; // SPCXB leg's WBNB input
+            uint256 usdtLeg = oracle.quoteHop(WBNB, USDT, WBNB_USDT_FEE, uint128(legIn));
+            uint256 quoted = oracle.quoteHop(USDT, SPCXB, 2500, uint128(usdtLeg));
+            uint256 realized = IERC20(SPCXB).balanceOf(basketAddr);
+
+            assertGt(quoted, 0, "oracle produced a quote");
+            assertGt(realized, (quoted * 80) / 100, "realized within 20% below the TWAP quote");
+            assertLt(realized, (quoted * 120) / 100, "realized within 20% above the TWAP quote");
+        }
+
+        // Real WBNB→USDT→stock swaps happened: the basket physically holds all 4 stocks.
         assertGt(IERC20(SPCXB).balanceOf(basketAddr), 0, "basket holds SPCXB");
-        assertGt(IERC20(QQQB).balanceOf(basketAddr), 0, "basket holds QQQB");
         assertGt(IERC20(NVDAB).balanceOf(basketAddr), 0, "basket holds NVDAB");
+        assertGt(IERC20(AAPLB).balanceOf(basketAddr), 0, "basket holds AAPLB");
+        assertGt(IERC20(GMEON).balanceOf(basketAddr), 0, "basket holds GMEon");
 
         // Grid fed: the whole minted basket forwarded into the vault's single grid.
         assertEq(ugm.yieldByAsset(assetHash), basketMinted, "grid received all basket shares");
         assertEq(basket.balanceOf(vaultAddr), 0, "no basket left on the vault");
 
-        // ── 6. A holder redeems basket shares → gets a pro-rata slice of ALL 3 real stocks. ──
+        // ── 6. A holder redeems basket shares → gets a pro-rata slice of ALL 4 real stocks. ──
         // The MockUGM custodies the shares it pulled; a seat holder would hold them in production.
         uint256 redeemShares = ugm.yieldByAsset(assetHash) / 2;
         assertGt(redeemShares, 0, "shares to redeem");
@@ -225,10 +256,11 @@ contract FlapVaultBackedLaunchForkTest is FlapBSCFixture {
         vm.prank(address(ugm));
         uint256[] memory got = basket.redeem(redeemShares, holder);
 
-        assertEq(got.length, 3, "3 stocks returned");
+        assertEq(got.length, 4, "4 stocks returned");
         assertGt(IERC20(SPCXB).balanceOf(holder), 0, "holder got SPCXB");
-        assertGt(IERC20(QQQB).balanceOf(holder), 0, "holder got QQQB");
         assertGt(IERC20(NVDAB).balanceOf(holder), 0, "holder got NVDAB");
+        assertGt(IERC20(AAPLB).balanceOf(holder), 0, "holder got AAPLB");
+        assertGt(IERC20(GMEON).balanceOf(holder), 0, "holder got GMEon");
         assertEq(basket.totalSupply(), basketMinted - redeemShares, "supply burned by redeem");
         assertEq(IERC20(SPCXB).balanceOf(holder), got[0], "SPCXB out matches return value");
     }
@@ -245,7 +277,7 @@ contract FlapVaultBackedLaunchForkTest is FlapBSCFixture {
         vm.deal(address(vault), FUND);
 
         vm.prank(makeAddr("rando"));
-        vm.expectRevert(bytes(unicode"Not authorized keeper / 未授权的keeper"));
+        vm.expectRevert(bytes(unicode"Not a keeper / 非keeper"));
         vault.distributeUniform(0, block.timestamp + 300);
 
         // The mainnet Guardian is always a permitted keeper (Rule 001).

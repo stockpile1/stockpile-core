@@ -12,6 +12,7 @@ import {StockBasket} from "../src/vault/StockBasket.sol";
 
 import {MockMintableERC20} from "../test/vault/mocks/MockMintableERC20.sol";
 import {MockV3Router} from "../test/vault/mocks/MockV3Router.sol";
+import {MockSlippageOracle} from "../test/vault/mocks/MockSlippageOracle.sol";
 import {VanityHelper} from "../test/vault/lib/VanityHelper.sol";
 import {StockConfig} from "./StockConfig.sol";
 
@@ -151,7 +152,11 @@ contract LaunchVaultTokenTestnet is Script, VanityHelper {
         stocks[2] = address(new MockMintableERC20("AAPLB-T", "AAPLB-T", 18));
         stocks[3] = address(new MockMintableERC20("GMEon-T", "GMEon-T", 18));
         factory =
-            address(new StockpileBasketVaultFactory(TWBNB, address(usdt), UGM, address(router), WBNB_USDT_FEE));
+            address(
+            new StockpileBasketVaultFactory(
+                TWBNB, address(usdt), UGM, address(router), WBNB_USDT_FEE, address(new MockSlippageOracle())
+            )
+        );
     }
 
     // ── VaultDataV1: 4-stock basket (fees + weights from StockConfig; weights sum to 10_000) ────

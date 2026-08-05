@@ -78,6 +78,19 @@ interface ITaxToken {
     function taxRate() external view returns (uint256);
 }
 
+/// @notice Off-vault TWAP slippage oracle (see {StockpileSlippageOracle}). Reverts rather than returning a
+///         permissive value, so a failure skips the leg instead of sanctioning an unbounded swap.
+interface ISlippageOracle {
+    /// @notice TWAP-implied output of the shared WBNB→USDT hop, quoted once per distribute and scaled
+    ///         across the legs (each `observe()` costs real gas inside the 2M trigger budget).
+    function quoteWbnbForUsdt(uint256 wbnbIn) external view returns (uint256 usdtOut);
+    /// @notice Slippage floor for the USDT→stock hop given the USDT notionally entering it.
+    function minOutForUsdtIn(address stock, uint24 stockFee, uint256 usdtIn, uint16 maxSlippageBps)
+        external
+        view
+        returns (uint256 minOut);
+}
+
 /// @notice Off-vault {StockBasket} deployer (keeps the vault runtime under EIP-170; see {StockBasketDeployer}).
 interface IStockBasketDeployer {
     function deployBasket(string calldata name, string calldata symbol, address[] calldata stocks, address vault)
@@ -125,28 +138,40 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
 
     /// @notice Hard cap on {commissionBps}: guarantees the commission can never exceed 10% of a
     ///         receipt, so seat holders always keep >= 90% of every distribute. Guardian may only lower it.
-    uint16 public constant MAX_COMMISSION_BPS = 1_000; // 10%
+    uint16 internal constant MAX_COMMISSION_BPS = 1_000; // 10%
     /// @notice Sanity ceiling on {minInterval} so a fat-fingered value cannot lock {distribute} forever.
-    uint256 public constant MAX_MIN_INTERVAL = 30 days;
+    uint256 internal constant MAX_MIN_INTERVAL = 30 days;
     /// @notice UGM grid-size bounds (mirror `UnifiedGridManager.MIN_TOTAL_SEATS` /
     ///         `MAX_SINGLE_TX_CREATE_TOTAL_SEATS`). A launch grid size must fall in this range.
-    uint32 public constant MIN_TOTAL_SEATS = 4;
-    uint32 public constant MAX_SINGLE_TX_CREATE_TOTAL_SEATS = 1_024;
+    uint32 internal constant MIN_TOTAL_SEATS = 4;
+    uint32 internal constant MAX_SINGLE_TX_CREATE_TOTAL_SEATS = 1_024;
     /// @notice UGM Harberger tax-rate bounds (mirror `MIN_TAX_BPS` / `MAX_TAX_BPS`).
-    uint16 public constant MIN_TAX_BPS = 10;
-    uint16 public constant MAX_TAX_BPS = 1_000;
+    uint16 internal constant MIN_TAX_BPS = 10;
+    uint16 internal constant MAX_TAX_BPS = 1_000;
     /// @notice Upper bound on the number of stock legs (L5): a launcher-chosen leg count that is too large
     ///         would gas-brick this vault's own `setupMarket` / `distribute` loops. Bounding it here keeps
     ///         both within a sane gas envelope (funds stay Guardian-recoverable regardless).
-    uint256 public constant MAX_STOCKS = 20;
+    uint256 internal constant MAX_STOCKS = 20;
     /// @notice Max stock legs a TRIGGERED distribute may carry. The Flap Trigger Service hard-caps every
     ///         callback at 2,000,000 gas (Rule 008 §4) and a callback that exceeds it is recorded FAILED.
-    ///         Measured against live PancakeSwap V3 pools: ~690k fixed (wrap + commission + basket deposit +
-    ///         grid push + re-arm) plus ~225k per leg, so 5 legs lands near 1.8M and 6 exceeds the budget.
-    ///         Vaults with more legs than this must use the keeper path ({distribute} / {distributeUniform}),
-    ///         which has no such cap; {scheduleDistribute} rejects them up front rather than letting the
-    ///         service burn a fee on a callback that can never fit.
-    uint256 public constant MAX_TRIGGER_STOCKS = 5;
+    ///
+    ///         Measured against LIVE PancakeSwap V3 pools with the TWAP floor enabled: a 4-leg distribute
+    ///         costs ~1.82M, i.e. ~455k per leg. Adding the callback's re-arm puts the production
+    ///         configuration near 1.9M — inside the budget, but with little room, so a 5th leg (~2.27M)
+    ///         cannot fit. Vaults with more legs must use the keeper path ({distribute} /
+    ///         {distributeUniform}), which has no such cap; {scheduleDistribute} rejects them up front
+    ///         rather than letting the service burn a fee on a callback that can never succeed.
+    ///
+    ///         If a callback ever does run out of gas the whole thing reverts, INCLUDING the request
+    ///         consumption, so `triggerPending` stays set and the service's permissionless `retryTrigger`
+    ///         (which runs uncapped) recovers it. That is a fallback, not the intended path.
+    uint256 public constant MAX_TRIGGER_STOCKS = 4;
+    /// @notice Hard ceiling on {maxSlippageBps}: a looser floor than 10% would not meaningfully bound a
+    ///         swap, so the Guardian cannot widen the tolerance past it.
+    uint16 internal constant MAX_SLIPPAGE_BPS = 1_000;
+    /// @notice Tolerance {initialize} starts every vault at; the Guardian may retune it within
+    ///         {MAX_SLIPPAGE_BPS}. Never 0, which would demand the full TWAP output and fail every swap.
+    uint16 internal constant DEFAULT_MAX_SLIPPAGE_BPS = 300; // 3%
 
     // ── Routing immutables (set once in the constructor; shared by all proxies) ─
 
@@ -162,6 +187,8 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
     uint24 public immutable wbnbUsdtFee;
     /// @notice Off-vault {StockBasket} deployer (see {StockBasketDeployer}) — keeps this impl under EIP-170.
     address public immutable basketDeployer;
+    /// @notice Off-vault TWAP slippage oracle (see {StockpileSlippageOracle}) consulted by {swapLeg}.
+    address public immutable slippageOracle;
 
     // ── Per-leg configuration (set once in `initialize`) ─────────────────────
 
@@ -238,6 +265,10 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
     ///         testing `pendingRequestId != 0`, because the service does not promise non-zero ids.
     bool public triggerPending;
 
+    /// @notice Tolerance below the oracle's TWAP-implied output that {swapLeg} will accept, in bps.
+    ///         Seeded to {DEFAULT_MAX_SLIPPAGE_BPS} at init; capped by {MAX_SLIPPAGE_BPS}.
+    uint16 public maxSlippageBps;
+
     // ── Guardian rescue: incoming-BNB forward switch (SYS-REQ-RESCUE-MECHANISM) ─
 
     /// @notice When true, native BNB arriving at {receive} is forwarded straight to {forwardAddress}
@@ -287,6 +318,8 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
     event PendingTriggerCleared(uint256 indexed requestId);
     /// @notice Emitted when the Guardian arms or disarms the incoming-BNB forward switch.
     event AutoForwardSet(bool enabled, address indexed forwardAddress);
+    /// @notice Emitted when the Guardian retunes the oracle slippage tolerance.
+    event MaxSlippageSet(uint16 bps);
     event KeeperSet(address indexed keeper, bool allowed);
     event CommissionSet(uint16 newBps);
     event TreasurySet(address indexed newTreasury);
@@ -306,7 +339,7 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
     ///         permitted keeper — Rule 001 mandates Guardian access to every privileged function).
     modifier onlyKeeper() {
         require(
-            keepers[msg.sender] || msg.sender == _getGuardian(), unicode"Not authorized keeper / 未授权的keeper"
+            keepers[msg.sender] || msg.sender == _getGuardian(), unicode"Not a keeper / 非keeper"
         );
         _;
     }
@@ -322,11 +355,12 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
         address _ugm,
         address _swapRouter,
         uint24 _wbnbUsdtFee,
-        address _basketDeployer
+        address _basketDeployer,
+        address _slippageOracle
     ) {
         require(
             _wbnb != address(0) && _usdt != address(0) && _ugm != address(0) && _swapRouter != address(0)
-                && _basketDeployer != address(0),
+                && _basketDeployer != address(0) && _slippageOracle != address(0),
             unicode"Zero address / 零地址"
         );
         wbnb = _wbnb;
@@ -335,6 +369,7 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
         swapRouter = _swapRouter;
         wbnbUsdtFee = _wbnbUsdtFee;
         basketDeployer = _basketDeployer;
+        slippageOracle = _slippageOracle;
         _disableInitializers();
     }
 
@@ -364,6 +399,10 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
         bytes calldata _stocksData
     ) external initializer {
         __ReentrancyGuard_init();
+
+        // Seed the oracle slippage tolerance (AUDIT v9 Finding 2). Doing it here rather than falling back
+        // per swap keeps `swapLeg` — the hottest path, and the one inside the 2M trigger budget — branchless.
+        maxSlippageBps = DEFAULT_MAX_SLIPPAGE_BPS;
 
         require(_treasury != address(0), unicode"Zero address / 零地址");
         require(_commissionBps <= MAX_COMMISSION_BPS, unicode"Commission too high / 佣金过高");
@@ -567,8 +606,8 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
     ///      an unregistered/paused grid is SKIPPED, never bricking distribute. A skipped swap leg's WBNB is
     ///      retained for the next round; a skipped grid push leaves the basket shares on the vault.
     function _distribute(uint256[] memory minOut, uint256 deadline) private returns (uint256 basketMinted) {
-        require(basket != address(0), unicode"Market not set up / 市场未建立");
-        require(minOut.length == _stocks.length, unicode"minOut length mismatch / minOut长度不匹配");
+        require(basket != address(0), unicode"No market / 市场未建立");
+        require(minOut.length == _stocks.length, unicode"minOut length / minOut长度错");
         require(block.timestamp >= lastDistribute + minInterval, unicode"Too soon / 时间未到");
 
         address _wbnb = wbnb;
@@ -661,6 +700,14 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
 
         IERC20(wbnb).forceApprove(swapRouter, net);
 
+        // Quote the SHARED WBNB→USDT hop once for the whole round; hop 1 is linear in the input, so each
+        // leg's USDT notional is just its pro-rata share. Doing this per leg instead would re-derive an
+        // identical number at ~56k gas each, which the 2,000,000-gas trigger callback cannot afford.
+        // This one is NOT isolated per leg: WBNB/USDT is the deepest pool on the chain (observation
+        // cardinality in the thousands), so a failure here is a systemic condition under which no leg
+        // could be priced anyway — not the per-leg pool risk the try/catch below exists for.
+        uint256 usdtForNet = ISlippageOracle(slippageOracle).quoteWbnbForUsdt(net);
+
         uint256 allocated;
         for (uint256 i = 0; i < n; i++) {
             uint256 amountIn;
@@ -674,7 +721,7 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
 
             // Best-effort per leg: an isolated self-external-call lets a dead pool / unreachable minOut
             // revert ONLY that leg. The catch skips it (amounts[i] stays 0) and its WBNB is retained.
-            try this.swapLeg(i, amountIn, minOut[i], deadline) returns (uint256 out) {
+            try this.swapLeg(i, amountIn, (usdtForNet * amountIn) / net, minOut[i], deadline) returns (uint256 out) {
                 amounts[i] = out;
                 legSpend[i] = amountIn;
                 spentWBNB += amountIn;
@@ -691,9 +738,23 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
     ///         balance delta received. Invoked ONLY by {distribute} as an external self-call so each leg
     ///         gets an isolated, atomically-revertable sub-transaction. Gated to `msg.sender == this`.
     /// @dev    FoT-robust: returns the vault's ACTUAL post-swap balance delta, not the router's return.
-    function swapLeg(uint256 i, uint256 amountIn, uint256 minOut, uint256 deadline) external returns (uint256 out) {
+    function swapLeg(uint256 i, uint256 amountIn, uint256 usdtIn, uint256 minOut, uint256 deadline)
+        external
+        returns (uint256 out)
+    {
         require(msg.sender == address(this), unicode"Only self / 仅限自身");
         StockLeg storage leg = _stocks[i];
+
+        // ORACLE FLOOR (AUDIT v9 Finding 2). The trigger path carries no caller `minOut` — the Trigger
+        // Service callback takes no parameters — so without this the swap would run unbounded. Take the
+        // STRICTER of the caller's floor and the TWAP-implied one, so the keeper path can only ever
+        // tighten it, never loosen it. `usdtIn` is this leg's share of the shared WBNB→USDT quote, so only
+        // hop 2 is priced here. The oracle REVERTS on a missing/young pool rather than returning a
+        // permissive value; that revert is caught by `_swapAll`, which skips this leg and emits
+        // `LegSkipped` — fail-closed and observable, never a silent zero floor.
+        uint256 floor =
+            ISlippageOracle(slippageOracle).minOutForUsdtIn(leg.stock, leg.stockFee, usdtIn, maxSlippageBps);
+        if (floor > minOut) minOut = floor;
 
         bytes memory path = abi.encodePacked(wbnb, wbnbUsdtFee, usdt, leg.stockFee, leg.stock);
 
@@ -802,7 +863,7 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
     /// @param  token The payout token to withdraw (typically the grid's `taxToken`, i.e. WBNB).
     /// @return amount The amount pulled in (0 if the UGM had nothing credited).
     function claimGridPayout(address token) external nonReentrant returns (uint256 amount) {
-        require(basket != address(0), unicode"Market not set up / 市场未建立");
+        require(basket != address(0), unicode"No market / 市场未建立");
         require(token != address(0), unicode"Zero address / 零地址");
         try IUGM(ugm).claimPayout(token) returns (uint256 a) {
             amount = a;
@@ -817,13 +878,16 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
     /// @notice The Flap Trigger Service for the current chain (the decentralized scheduler that calls
     ///         {trigger} back). Chain-fixed exactly like {VaultBase}'s portal/guardian resolution, so no
     ///         privileged address can ever be repointed.
-    function triggerService() public view returns (address) {
+    /// @dev Resolves to `address(0)` on an unsupported chain and then fails the `require` — Rule 004
+    ///      (SYS-REQ-LITERAL-ERRORS) requires every developer-authored revert path to be a
+    ///      `require(condition, "literal")`, never a standalone `revert("...")`.
+    function triggerService() public view returns (address ts) {
         uint256 chainId = block.chainid;
-        if (chainId == 56) return 0xcf4EE25035CF883895110f367F5BA8172416a7F9; // BNB mainnet
-        if (chainId == 97) return 0x560E9830926C9e0EB98a59c6b9902383Fc0D9Eb2; // BNB testnet
-        if (chainId == 4663) return 0xD3421B1b616a72bB88993A0cf75709BB8D532cc1; // Robinhood mainnet
-        if (chainId == 46630) return 0x34e7624e2c8F944Db1adD9a604fdB7C439CaEa1c; // Robinhood testnet
-        revert(unicode"Trigger service unavailable on this chain / 本链无触发服务");
+        if (chainId == 56) ts = 0xcf4EE25035CF883895110f367F5BA8172416a7F9; // BNB mainnet
+        else if (chainId == 97) ts = 0x560E9830926C9e0EB98a59c6b9902383Fc0D9Eb2; // BNB testnet
+        else if (chainId == 4663) ts = 0xD3421B1b616a72bB88993A0cf75709BB8D532cc1; // Robinhood mainnet
+        else if (chainId == 46630) ts = 0x34e7624e2c8F944Db1adD9a604fdB7C439CaEa1c; // Robinhood testnet
+        require(ts != address(0), unicode"No trigger service on this chain / 本链无触发服务");
     }
 
     /// @notice Schedule the next {distribute} with the Flap Trigger Service. PERMISSIONLESS — anyone may
@@ -840,13 +904,13 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
 
     /// @dev Shared scheduling body. Private so {trigger} can re-arm from inside its own guarded frame.
     function _schedule() private returns (uint256 requestId) {
-        require(basket != address(0), unicode"Market not set up / 市场未建立");
+        require(basket != address(0), unicode"No market / 市场未建立");
         require(!triggerPending, unicode"Already scheduled / 已排程");
-        require(_stocks.length <= MAX_TRIGGER_STOCKS, unicode"Too many legs for trigger / 腿数超过触发上限");
+        require(_stocks.length <= MAX_TRIGGER_STOCKS, unicode"Too many legs / 腿数过多");
 
         address ts = triggerService();
         uint256 fee = IFlapTriggerService(ts).getFee(); // LIVE read — never hardcode (dynamic fee)
-        require(address(this).balance >= fee, unicode"Insufficient BNB for trigger fee / BNB不足以支付触发费");
+        require(address(this).balance >= fee, unicode"BNB too low for fee / BNB不足付费");
 
         // `executeAfter` is a LOWER BOUND, not an appointment: ask for the moment the time-gate opens.
         uint256 due = lastDistribute + minInterval;
@@ -929,7 +993,7 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
     ///         this vault via `ugm.setApprovedAdapter(vault, true)`. Until bound, {distribute}'s grid push
     ///         best-effort-skips, so nothing bricks.
     function registerWithGrid() external nonReentrant {
-        require(basket != address(0), unicode"Market not set up / 市场未建立");
+        require(basket != address(0), unicode"No market / 市场未建立");
         IUGM(ugm).registerAsset(gridId, assetHash);
     }
 
@@ -973,6 +1037,16 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
             IERC20(token).safeTransfer(to, bal);
             emit EmergencyWithdrawToken(token, to, bal);
         }
+    }
+
+    /// @notice Retune how far below the oracle's TWAP-implied output a swap may execute.
+    /// @dev    Guardian-only, must be non-zero and at most {MAX_SLIPPAGE_BPS}, so the floor can never be
+    ///         disabled. Tightening it makes legs more likely to skip (observable via `LegSkipped`);
+    ///         loosening it accepts worse execution.
+    function setMaxSlippageBps(uint16 bps) external onlyGuardian {
+        require(bps > 0 && bps <= MAX_SLIPPAGE_BPS, unicode"Bad slippage bps / 滑点参数无效");
+        maxSlippageBps = bps;
+        emit MaxSlippageSet(bps);
     }
 
     /// @notice Arm or disarm the incoming-BNB forward switch on {receive} (SYS-REQ-RESCUE-MECHANISM).
@@ -1026,39 +1100,38 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
     function vaultUISchema() public pure override returns (VaultUISchema memory schema) {
         schema.vaultType = "StockpileBasketVault";
         schema.description =
-            unicode"Routes a Flap token's BNB tax into a stock basket, then a Stockpile grid."
-            unicode" / 将 Flap 代币的 BNB 税收路由到股票篮子，再进入 Stockpile 网格。";
+            unicode"Routes a Flap token's BNB tax into a stock basket, then a Stockpile grid. / 将代币 BNB 税收路由到股票篮子，再进入网格。";
 
         schema.methods = new VaultMethodSchema[](6);
 
         // Reads — all share the "no inputs, one scalar output" shape, so they go through {_readMethod}.
         schema.methods[0] = _readMethod(
             "pendingDistribute",
-            unicode"BNB/WBNB accrued, awaiting distribute(). / 已累积、等待 distribute() 的 BNB/WBNB。",
+            unicode"BNB awaiting distribute(). / 等待 distribute() 的 BNB。",
             "pending",
             "uint256",
-            unicode"Pending BNB/WBNB / 待处理 BNB/WBNB",
+            unicode"Pending BNB / 待处理 BNB",
             18
         );
         schema.methods[1] = _readMethod(
             "commissionBps",
-            unicode"Commission cap per distribute(), in bps (100 = 1%). / 每次 distribute() 的佣金上限（基点，100 = 1%）。",
+            unicode"Commission cap per distribute(), bps. / 每次 distribute() 的佣金上限（基点）。",
             "commissionBps",
             "uint16",
-            unicode"Commission cap (bps) / 佣金上限（基点）",
+            unicode"Cap (bps) / 上限（基点）",
             0
         );
         schema.methods[2] = _readMethod(
             "basket",
-            unicode"The StockBasket index token. / StockBasket 指数代币。",
+            unicode"Index token. / 指数代币。",
             "basket",
             "address",
-            unicode"StockBasket address / StockBasket 地址",
+            unicode"Address / 地址",
             0
         );
         schema.methods[3] = _readMethod(
             "gridId",
-            unicode"The UGM grid this vault feeds. / 本金库供给的 UGM 网格。",
+            unicode"Grid fed by this vault. / 本金库供给的网格。",
             "gridId",
             "uint256",
             unicode"Grid id / 网格 id",
@@ -1069,8 +1142,7 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
         // Trigger Service, which then calls back and distributes without any keeper being appointed.
         schema.methods[4] = _readMethod(
             "scheduleDistribute",
-            unicode"Anyone may call: schedule the next distribute via the Flap Trigger Service."
-            unicode" / 任何人可调用：通过 Flap 触发服务排程下一次 distribute。",
+            unicode"Anyone may call: schedule the next distribute via the Flap Trigger Service. / 任何人可调用：排程下一次 distribute。",
             "requestId",
             "uint256",
             unicode"Request id / 请求 id",
@@ -1081,19 +1153,18 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
         // Write: distributeUniform(uint256 minOutPerLeg, uint256 deadline) — keeper/guardian gated.
         schema.methods[5].name = "distributeUniform";
         schema.methods[5].description =
-            unicode"Keeper path: swap, mint basket shares, feed the grid, skim commission. One floor per leg."
-            unicode" / Keeper 路径：兑换、铸造份额、供给网格、抽取佣金。每腿一个下限。";
+            unicode"Keeper path: swap, mint shares, feed the grid, skim commission. / Keeper 路径：兑换、铸造份额、供给网格、抽取佣金。";
         schema.methods[5].inputs = new FieldDescriptor[](2);
         // `decimals` is 0, not 18 (audit V-02): the floor applies to every leg, and the stocks are
         // launcher-chosen tokens whose decimals may differ, so the value is passed as RAW base units.
         schema.methods[5].inputs[0] = FieldDescriptor(
             "minOutPerLeg",
             "uint256",
-            unicode"Min output per leg, raw base units / 每腿最小输出（原始单位）",
+            unicode"Min out per leg, raw units / 每腿最小输出（原始单位）",
             0
         );
         schema.methods[5].inputs[1] =
-            FieldDescriptor("deadline", "time", unicode"Swaps revert after this time / 兑换在此时间后回退", 0);
+            FieldDescriptor("deadline", "time", unicode"Swaps revert after / 兑换在此后回退", 0);
         schema.methods[5].outputs = new FieldDescriptor[](0);
         schema.methods[5].approvals = new ApproveAction[](0);
         schema.methods[5].isWriteMethod = true;

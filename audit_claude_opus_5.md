@@ -59,14 +59,14 @@ Fixes applied in this repo after the audit. Full suite green: **223 passed / 0 f
 |----|----------|--------|--------------|
 | H-01 | High | ✅ **Fixed** | `claimGridPayout(address)` added — permissionless, wrapped against the UGM's `"nothing"` revert; `claimPayout` added to the local `IUGM` |
 | H-02 | High | ✅ **Fixed** | `StockBasket.deposit(amounts, legValues, to)` mints only the value of legs that actually land; a nothing-landed round mints 0 instead of reverting |
-| H-03 | High | ⚠️ **Accepted risk** | No oracle added — see the finding's *Remediation decision*. Keeper-gating is the accepted control; swap reachability re-verified and now regression-tested |
+| H-03 | High | ✅ **Fixed** | Superseded by v9 Finding 2: `StockpileSlippageOracle` now imposes a TWAP floor on every swap path. The earlier "accepted risk" note is retained below for history |
 | M-01 | Medium | ✅ **Fixed** | `lastDistribute` advances only on a productive round, so an unproductive one cannot burn the interval |
 | M-05 | Medium | ✅ **Fixed** | Per-leg approvals isolated via the self-gated `approveStock`; an un-approvable stock drops its leg instead of reverting the round |
 | L-02 | Low | ✅ **Fixed** | `LegSkipped` (swap + approve phases), `GridFeedFailed`, `GridPayoutClaimed` events — no skip is silent any more |
 | L-03 | Low | ✅ **Fixed** | `_depositToBasket` deposits balances, not this round's deltas, so residue from a skipped pull self-heals |
 | V-01 | Medium | 🟡 **Partial** | `scheduleDistribute` added to `vaultUISchema` (now 6 methods). `setupMarket` / `registerWithGrid` still unlisted |
 | V-02 | Low | ✅ **Fixed** | `minOutPerLeg` `decimals` 18 → 0, described as raw base units |
-| V-04, M-02, M-03, M-04, L-01, L-04 | — | Open | Not yet addressed |
+| V-04, M-02, M-04, L-01, L-04 | — | Open | Not yet addressed |
 
 ### Post-audit change: Flap Trigger Service integration (Rule 008)
 
@@ -86,6 +86,54 @@ Rule 008 conformance: callback validates `msg.sender == triggerService()` (chain
 `MAX_TRIGGER_STOCKS = 5` was therefore introduced and `scheduleDistribute` rejects vaults with more legs, so the service never burns a fee on a callback that cannot fit. **A 7-stock basket cannot use the triggered path** and must fall back to the keeper path (`distribute` / `distributeUniform`), which has no gas cap — which reinstates the Guardian dependency for those vaults. This is a product decision that needs an explicit answer, not a default.
 
 **Basket cut to 4 legs.** `StockConfig` was reduced from 7 stocks to **SPCXB, NVDAB, AAPLB, GMEon** (equal 2,500 bps weights) so a distribute fits the callback budget with ~20% headroom. QQQB, SPYB, TSLAB and XAUt were dropped. All four legs' USDT pools were verified live on BSC at the 2500 tier with non-trivial liquidity — which matters because the triggered path swaps with a zero floor. `DeployVaultFactory.s.sol` and `LaunchVaultTokenTestnet.s.sol` were updated to match (`STOCK0..STOCK3`).
+
+### Post-audit change: Flap reviewer findings (report v9)
+
+All three v9 findings were confirmed real and fixed; all are marked **TP** in that report.
+
+**v9 Finding 1 — standalone `revert()` (High, `SYS-REQ-LITERAL-ERRORS`).** `triggerService()` used a bare
+`revert(unicode"…")`, which Rule 004 forbids even when the string is a well-formed bilingual literal. It now
+resolves to `address(0)` on an unsupported chain and ends in `require(ts != address(0), …)`. No standalone
+`revert("...")` remains in any in-scope developer contract.
+
+**v9 Finding 2 — zero slippage floor on the trigger path (Low) — this supersedes H-03.** The auditor's
+framing is what mattered: *"any adverse pricing at execution"*, not merely MEV. A private submission RPC
+stops in-block sandwiching but does nothing about a thin or dislocated pool, and a zero floor bounds
+neither. **H-03 is therefore no longer an accepted risk — it is fixed.**
+
+`StockpileSlippageOracle` was added: a standalone, fund-free, permissionless-to-read contract that derives a
+floor from PancakeSwap V3's own 300-second TWAP. `swapLeg` now swaps under `max(callerMinOut, twapFloor)`,
+so **every** path — trigger and keeper alike — is bounded and a caller can only ever tighten the floor.
+Tolerance is a Guardian-tuned `maxSlippageBps`, seeded to 3%, hard-capped at 10%, and rejected at 0 so the
+floor can never be switched off. Failure is fail-closed: the oracle reverts on a missing or too-young pool
+instead of returning a permissive value, and that revert skips the leg with a `LegSkipped` event.
+
+Two things were verified rather than assumed. Live oracle cardinality was checked before committing to a
+TWAP (60–2400 across all five pools, so `observe()` is usable), and the hand-transcribed TickMath/FullMath
+is validated on a BSC-mainnet fork against a **real executed swap** — realized output asserted within ±20%
+of the quote, which is the check that would catch a transcription error, since a wrong constant would not
+revert but would silently quote an absurd price.
+
+It is not free. Adding two `observe()` calls per leg pushed a 4-leg distribute to ~1.91M against the Trigger
+Service's 2M callback cap. The shared WBNB→USDT hop is now quoted **once per distribute** and scaled across
+legs rather than re-derived per leg, bringing it back to **~1.82M measured on live pools**. `MAX_TRIGGER_STOCKS`
+was reduced 5 → 4 to match: a 5th leg (~2.27M) no longer fits. Headroom on the production 4-leg basket is
+about 5% once the callback's re-arm is counted, so if a callback ever does run out of gas the whole call
+reverts — including the request consumption — leaving `triggerPending` set for the service's permissionless,
+uncapped `retryTrigger`. That is a fallback, not the intended path.
+
+**v9 Finding 3 — `StockBasket.redeem` forfeiture (Low) — this is M-03, now fixed.** A failed payout leg no
+longer costs the redeemer their slice: it is credited to the recipient in `unpaid[stock][to]`, emitted as
+`PayoutDeferred`, and collected later via `claimUnpaid(stock, to)` (destination caller-supplied, so a
+since-blacklisted holder can redirect it). `totalDeferred[stock]` excludes booked amounts from the pro-rata
+base in `redeem` / `previewRedeem` / `reserves`, so the same tokens can never be paid twice — the regression
+test asserts a later redeemer of the remaining shares receives only the undeferred portion.
+
+**Also in this pass.** The factory constructor gained the oracle address, so `StockpileBasketVaultFactory`,
+both deploy scripts and the unit-test fixtures were rewired; a `MockSlippageOracle` (floor 0 by default)
+keeps the unit suite exercising the pre-oracle paths, while the fork suite runs the real oracle. The fork
+test was also switched to the **production 4-stock basket** so its gas figure measures what actually ships.
+As a side effect the factory's initcode came back under the EIP-3860 limit (margin was −335, now +385).
 
 ### Post-audit change: Flap reviewer findings (report v8)
 
@@ -414,7 +462,7 @@ Covered by the inverted `test_Deposit_ReentrantStock_NeutralizedAndSkipped` and 
 
 ### H-03: Slippage protection is effectively non-binding — one scalar `minOut` across heterogeneous legs, silent skip on breach, plus keeper self-sandwich
 
-**Severity**: High · **Status**: ⚠️ Accepted risk (see *Remediation decision* below) · *(also the Rule 003 fairness violation)*
+**Severity**: High · **Status**: ✅ Fixed (superseded by *v9 Finding 2* — the accepted-risk note below is kept for history) · *(also the Rule 003 fairness violation)*
 **File**: `src/vault/StockpileBasketVaultV2.sol:466-478`, `:598-603`, `:613-632`
 
 **Description**: Three properties compose into an exploitable MEV surface.
@@ -535,7 +583,7 @@ Longer term, adopt the chunked `createGridShell` flow the UGM NatSpec already an
 
 ### M-03: `StockBasket.redeem` permanently forfeits a redeemer's slice of any stock whose transfer reverts
 
-**Severity**: Medium · **Status**: Open
+**Severity**: Medium · **Status**: ✅ Fixed (see *v9 Finding 3*)
 **File**: `src/vault/StockBasket.sol:222`, `:231-234`
 
 **Description**: `redeem` burns the caller's shares at `:222` and *then* pays out each stock via `try this._payout(...) catch { amounts[i] = 0; }` (`:231-234`). A reverting leg is zeroed and the slice stays in the basket — but the shares are already burned, so the claim is gone forever.
