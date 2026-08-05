@@ -37,10 +37,17 @@ interface IPancakeV3PoolOracle {
 ///   ── FAILURE BEHAVIOUR IS FAIL-CLOSED, BY DESIGN ───────────────────────────────
 ///
 ///   Every path here REVERTS rather than returning a permissive value: a missing pool, a pool too young
-///   for the window, or an out-of-range tick all bubble up. The vault calls this inside `swapLeg`, which
-///   is itself isolated in `_swapAll`'s try/catch, so a failure SKIPS that leg and emits `LegSkipped`
-///   instead of silently falling back to a zero floor. The keeper path (`distribute`/`distributeUniform`)
-///   remains available with an explicit caller-supplied floor if the oracle is ever unusable.
+///   for the window, or an out-of-range tick all bubble up. Never returning 0 is the point — a permissive
+///   return would read as "no floor needed" at exactly the moment pricing is unavailable.
+///
+///   The vault isolates EVERY call into this contract (AUDIT v11): the per-leg quote inside `swapLeg` is
+///   wrapped by `_swapAll`'s try/catch, and the shared WBNB→USDT quote is wrapped directly. So an
+///   unusable oracle degrades instead of bricking:
+///     • the keeper path (`distribute` / `distributeUniform`) still executes under the caller's own
+///       explicit floors — it does NOT hard-depend on this contract;
+///     • the trigger path, which supplies no floors, skips the leg and emits `LegSkipped` rather than
+///       swapping unbounded.
+///   That distinction is enforced by the `minOut > 0` check in `swapLeg`, not by trusting this contract.
 contract StockpileSlippageOracle {
     /// @notice TWAP window. Long enough that moving the mean requires holding a dislocated price across
     ///         several blocks, short enough to track real moves in a fast market.

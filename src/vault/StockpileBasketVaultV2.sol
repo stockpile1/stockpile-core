@@ -165,7 +165,7 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
     ///         If a callback ever does run out of gas the whole thing reverts, INCLUDING the request
     ///         consumption, so `triggerPending` stays set and the service's permissionless `retryTrigger`
     ///         (which runs uncapped) recovers it. That is a fallback, not the intended path.
-    uint256 public constant MAX_TRIGGER_STOCKS = 4;
+    uint256 internal constant MAX_TRIGGER_STOCKS = 4;
     /// @notice Hard ceiling on {maxSlippageBps}: a looser floor than 10% would not meaningfully bound a
     ///         swap, so the Guardian cannot widen the tolerance past it.
     uint16 internal constant MAX_SLIPPAGE_BPS = 1_000;
@@ -703,10 +703,16 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
         // Quote the SHARED WBNB→USDT hop once for the whole round; hop 1 is linear in the input, so each
         // leg's USDT notional is just its pro-rata share. Doing this per leg instead would re-derive an
         // identical number at ~56k gas each, which the 2,000,000-gas trigger callback cannot afford.
-        // This one is NOT isolated per leg: WBNB/USDT is the deepest pool on the chain (observation
-        // cardinality in the thousands), so a failure here is a systemic condition under which no leg
-        // could be priced anyway — not the per-leg pool risk the try/catch below exists for.
-        uint256 usdtForNet = ISlippageOracle(slippageOracle).quoteWbnbForUsdt(net);
+        // ISOLATED like every other oracle call (AUDIT v11). `wbnbUsdtFee` is an immutable, so a fee tier
+        // pointing at a non-existent pool — or a WBNB/USDT pool that ever lacks {WINDOW} observations —
+        // would otherwise revert EVERY distribute of EVERY vault from this factory, permanently, leaving
+        // only the Guardian emergency withdraw. On failure `usdtForNet` stays 0, which makes each leg fall
+        // back to the caller's own floor: the keeper path survives (it supplies explicit floors) while the
+        // trigger path, which passes zeros, still fails closed on the `minOut > 0` check in {swapLeg}.
+        uint256 usdtForNet;
+        try ISlippageOracle(slippageOracle).quoteWbnbForUsdt(net) returns (uint256 q) {
+            usdtForNet = q;
+        } catch {}
 
         uint256 allocated;
         for (uint256 i = 0; i < n; i++) {
@@ -752,9 +758,14 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
         // hop 2 is priced here. The oracle REVERTS on a missing/young pool rather than returning a
         // permissive value; that revert is caught by `_swapAll`, which skips this leg and emits
         // `LegSkipped` — fail-closed and observable, never a silent zero floor.
-        uint256 floor =
-            ISlippageOracle(slippageOracle).minOutForUsdtIn(leg.stock, leg.stockFee, usdtIn, maxSlippageBps);
-        if (floor > minOut) minOut = floor;
+        if (usdtIn > 0) {
+            uint256 floor =
+                ISlippageOracle(slippageOracle).minOutForUsdtIn(leg.stock, leg.stockFee, usdtIn, maxSlippageBps);
+            if (floor > minOut) minOut = floor;
+        }
+        // NEVER swap unbounded: with the oracle unusable AND no caller floor there is nothing bounding this
+        // leg, so skip it. This is what keeps the trigger path (which passes zeros) fail-closed.
+        require(minOut > 0, unicode"No floor / 无下限");
 
         bytes memory path = abi.encodePacked(wbnb, wbnbUsdtFee, usdt, leg.stockFee, leg.stock);
 
@@ -1100,7 +1111,7 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
     function vaultUISchema() public pure override returns (VaultUISchema memory schema) {
         schema.vaultType = "StockpileBasketVault";
         schema.description =
-            unicode"Routes a Flap token's BNB tax into a stock basket, then a Stockpile grid. / 将代币 BNB 税收路由到股票篮子，再进入网格。";
+            unicode"Routes a Flap token's BNB tax into a stock basket, then a grid. / 将代币税收路由到股票篮子再进入网格。";
 
         schema.methods = new VaultMethodSchema[](6);
 
@@ -1115,7 +1126,7 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
         );
         schema.methods[1] = _readMethod(
             "commissionBps",
-            unicode"Commission cap per distribute(), bps. / 每次 distribute() 的佣金上限（基点）。",
+            unicode"Commission cap per distribute, bps. / 佣金上限（基点）。",
             "commissionBps",
             "uint16",
             unicode"Cap (bps) / 上限（基点）",
@@ -1142,7 +1153,7 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
         // Trigger Service, which then calls back and distributes without any keeper being appointed.
         schema.methods[4] = _readMethod(
             "scheduleDistribute",
-            unicode"Anyone may call: schedule the next distribute via the Flap Trigger Service. / 任何人可调用：排程下一次 distribute。",
+            unicode"Anyone may call: schedule the next distribute. / 任何人可调用：排程下一次分发。",
             "requestId",
             "uint256",
             unicode"Request id / 请求 id",
@@ -1153,7 +1164,7 @@ contract StockpileBasketVaultV2 is Initializable, VaultBaseV2, ReentrancyGuardUp
         // Write: distributeUniform(uint256 minOutPerLeg, uint256 deadline) — keeper/guardian gated.
         schema.methods[5].name = "distributeUniform";
         schema.methods[5].description =
-            unicode"Keeper path: swap, mint shares, feed the grid, skim commission. / Keeper 路径：兑换、铸造份额、供给网格、抽取佣金。";
+            unicode"Keeper path: swap, mint shares, feed the grid. / Keeper 路径：兑换、铸造份额、供给网格。";
         schema.methods[5].inputs = new FieldDescriptor[](2);
         // `decimals` is 0, not 18 (audit V-02): the floor applies to every leg, and the stocks are
         // launcher-chosen tokens whose decimals may differ, so the value is passed as RAW base units.

@@ -440,19 +440,45 @@ contract StockpileBasketVaultV2Test is Test {
         assertGt(v.pendingDistribute(), 0, "skipped leg's WBNB retained for the next round");
     }
 
-    /// @dev FAIL-CLOSED: an unusable oracle must skip the leg, never fall back to a zero floor.
-    function testOracleFailureSkipsRatherThanSwappingUnbounded() public {
+    /// @dev FAIL-CLOSED without bricking (AUDIT v11). An unusable oracle must not swap unbounded, but it
+    ///      must not revert the whole distribute either — otherwise a bad immutable `wbnbUsdtFee` would
+    ///      permanently brick every vault from the factory.
+    function testOracleFailureSkipsLegsButDoesNotBrickDistribute() public {
         StockpileBasketVaultV2 v = _newVault(address(new MockTaxToken(100)), 1000, 0);
         _setupAndRegister(v);
         vm.deal(address(v), 10 ether);
 
         oracle.setRevert(true); // every quote reverts (missing pool / window too young)
 
+        // Caller supplies no floors: nothing bounds any leg, so every leg skips — but no revert.
         vm.prank(GUARDIAN);
-        vm.expectRevert(); // the SHARED hop-1 quote is systemic, so the round cannot proceed at all
-        v.distribute(_minOut3(), block.timestamp + 1);
+        uint256 minted = v.distribute(_minOut3(), block.timestamp + 1);
 
-        assertEq(v.pendingDistribute(), 10 ether, "nothing was swapped");
+        assertEq(minted, 0, "nothing swapped without a floor");
+        assertEq(v.pendingDistribute(), 10 ether, "WBNB fully retained");
+        assertEq(v.lastDistribute(), 0, "unproductive round did not burn the interval");
+    }
+
+    /// @dev The keeper path must SURVIVE an unusable oracle: the caller already supplies explicit floors,
+    ///      so it has no reason to depend on the oracle at all (AUDIT v11).
+    function testKeeperPathSurvivesUnusableOracle() public {
+        StockpileBasketVaultV2 v = _newVault(address(new MockTaxToken(100)), 1000, 0);
+        _setupAndRegister(v);
+        vm.deal(address(v), 10 ether);
+
+        oracle.setRevert(true); // oracle completely unusable, including the shared hop-1 quote
+
+        // Explicit, reachable per-leg floors (1:1 mock router, so anything below the input clears).
+        uint256[] memory floors = new uint256[](3);
+        floors[0] = 1;
+        floors[1] = 1;
+        floors[2] = 1;
+
+        vm.prank(GUARDIAN);
+        uint256 minted = v.distribute(floors, block.timestamp + 1);
+
+        assertGt(minted, 0, "keeper distribute still works with its own floors");
+        assertGt(ugm.yieldByAsset(v.assetHash()), 0, "and still reaches the grid");
     }
 
     /// @dev The caller's floor may only ever TIGHTEN the oracle's, never loosen it.

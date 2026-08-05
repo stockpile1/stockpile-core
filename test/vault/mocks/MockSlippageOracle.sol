@@ -10,8 +10,14 @@ pragma solidity ^0.8.13;
 ///           • `setRevert(true)`         — mirror the real oracle's FAIL-CLOSED behaviour (missing pool /
 ///                                         window too young), so the vault's leg-skip path is exercised.
 contract MockSlippageOracle {
-    /// @notice Fixed floor returned for a given stock; 0 means "no floor".
+    /// @notice Explicit floor for a stock, used only when {hasFloor} is set for it.
     mapping(address => uint256) public floorOf;
+    /// @notice Whether {floorOf} was explicitly set for a stock.
+    mapping(address => bool) public hasFloor;
+    /// @notice Default floor as a fraction of the hop input, in bps. 9000 models a healthy oracle against
+    ///         {MockV3Router}'s 1:1 rate: the quote is reachable, so legs execute — which is what the
+    ///         pre-oracle suite expects. A floor of 0 would now mean "unbounded" and skip every leg.
+    uint16 public defaultFloorBps = 9_000;
     /// @notice When true every quote reverts, mirroring an unusable pool.
     bool public reverts;
 
@@ -23,6 +29,15 @@ contract MockSlippageOracle {
 
     function setFloor(address stock, uint256 amount) external {
         floorOf[stock] = amount;
+        hasFloor[stock] = true;
+    }
+
+    function setDefaultFloorBps(uint16 bps) external {
+        defaultFloorBps = bps;
+    }
+
+    function _floor(address stock, uint256 amountIn) internal view returns (uint256) {
+        return hasFloor[stock] ? floorOf[stock] : (amountIn * defaultFloorBps) / 10_000;
     }
 
     function setRevert(bool r) external {
@@ -33,9 +48,9 @@ contract MockSlippageOracle {
     ///      interface declares `view`, so the recording writes are done through a self-call-free trick:
     ///      the vault calls this via STATICCALL, so state writes here would revert. Recording is therefore
     ///      only performed by `probe`, which tests call directly.
-    function minOutFor(address stock, uint24, uint256, uint16) external view returns (uint256) {
+    function minOutFor(address stock, uint24, uint256 amountIn, uint16) external view returns (uint256) {
         require(!reverts, "MockSlippageOracle: no pool");
-        return floorOf[stock];
+        return _floor(stock, amountIn);
     }
 
     /// @notice Shared WBNB→USDT hop. Quotes 1:1, matching {MockV3Router}'s default rate, so the per-leg
@@ -46,9 +61,9 @@ contract MockSlippageOracle {
     }
 
     /// @notice Hop-2 floor. Mirrors {minOutFor}; the default 0 keeps the pre-oracle behaviour.
-    function minOutForUsdtIn(address stock, uint24, uint256, uint16) external view returns (uint256) {
+    function minOutForUsdtIn(address stock, uint24, uint256 usdtIn, uint16) external view returns (uint256) {
         require(!reverts, "MockSlippageOracle: no pool");
-        return floorOf[stock];
+        return _floor(stock, usdtIn);
     }
 
     /// @notice Non-view twin used by tests that want to record the arguments of a quote.
