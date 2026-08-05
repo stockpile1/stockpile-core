@@ -238,7 +238,7 @@ abstract contract FlapBSCFixture is Test, VanityHelper {
     ///        }
     ///        ```
     function _forkBSCMainnet() internal {
-        string memory rpcUrl = vm.envOr("BSC_RPC_URL", string("https://bsc-rpc.publicnode.com"));
+        string memory rpcUrl = vm.envOr("BSC_RPC_URL", string("https://bsc-dataseed.bnbchain.org"));
         vm.createSelectFork(rpcUrl);
 
         portal = IPortal(PORTAL);

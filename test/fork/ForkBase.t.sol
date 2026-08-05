@@ -11,7 +11,7 @@ abstract contract ForkBase is Test {
     IWBNB internal constant WBNB = IWBNB(BscAddresses.WBNB);
 
     function _forkBsc() internal {
-        string memory rpc = vm.envOr("BSC_RPC_URL", string("https://bsc-rpc.publicnode.com"));
+        string memory rpc = vm.envOr("BSC_RPC_URL", string("https://bsc-dataseed.bnbchain.org"));
         vm.createSelectFork(rpc);
         assertEq(block.chainid, BscAddresses.CHAIN_ID, "fork is not BSC mainnet");
     }
